@@ -77,6 +77,12 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 	 */
 	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_1, 0x0);
 	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_2, 0x0);
+	if (!gxp_lpm_wait_state_eq(gxp, LPM_TOP_PSM, LPM_ACTIVE_STATE)) {
+		dev_err(gxp->dev,
+			"failed to force TOP LPM to PS0 during blk down\n");
+		return -EAGAIN;
+	}
+
 	ret = pm_runtime_put_sync(gxp->dev);
 	if (ret)
 		/*
