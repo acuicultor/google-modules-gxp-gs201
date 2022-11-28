@@ -51,6 +51,8 @@
 #include "gxp-wakelock.h"
 #include "gxp.h"
 
+static struct gxp_dev *gxp_debug_pointer;
+
 #define __wait_event_lock_irq_timeout_exclusive(wq_head, condition, lock,      \
 						timeout, state)                \
 	___wait_event(wq_head, ___wait_cond_timeout(condition), state, 1,      \
@@ -2237,6 +2239,8 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&gxp->client_list);
 	mutex_init(&gxp->client_list_lock);
 
+	gxp_debug_pointer = gxp;
+
 	return 0;
 err_vd_destroy:
 	gxp_vd_destroy(gxp);
@@ -2277,6 +2281,8 @@ static int gxp_platform_remove(struct platform_device *pdev)
 	misc_deregister(&gxp->misc_dev);
 
 	devm_kfree(dev, (void *)gxp);
+
+	gxp_debug_pointer = NULL;
 
 	return 0;
 }
