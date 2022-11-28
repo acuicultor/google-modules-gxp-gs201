@@ -20,8 +20,8 @@
 #include "gxp-mailbox-driver.h"
 #include "gxp-pm.h"
 
-/* Timeout of 8s by default to account for slower emulation platforms */
-int gxp_mbx_timeout = 8000;
+/* Timeout of 1s by default */
+int gxp_mbx_timeout = 1000;
 module_param_named(mbx_timeout, gxp_mbx_timeout, int, 0660);
 
 /* Utilities of circular queue operations */
