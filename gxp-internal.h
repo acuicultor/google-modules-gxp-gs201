@@ -10,6 +10,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
+#include <linux/idr.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/list.h>
@@ -17,15 +18,24 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/platform_device.h>
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
 
 #include "gxp-config.h"
 
+#define IS_GXP_TEST IS_ENABLED(CONFIG_GXP_TEST)
+
+enum gxp_chip_revision {
+	GXP_CHIP_A0,
+	GXP_CHIP_B0,
+	/* used when the revision is not explicitly specified */
+	GXP_CHIP_ANY,
+};
+
 /* Holds Client's TPU mailboxes info used during mapping */
 struct gxp_tpu_mbx_desc {
 	uint phys_core_list;
-	uint virt_core_list;
 	size_t cmdq_size, respq_size;
 };
 
@@ -44,36 +54,34 @@ struct gxp_tpu_dev {
 };
 
 /* Forward declarations from submodules */
+struct gcip_domain_pool;
 struct gxp_client;
 struct gxp_mailbox_manager;
 struct gxp_debug_dump_manager;
-struct gxp_domain_pool;
 struct gxp_dma_manager;
 struct gxp_fw_data_manager;
 struct gxp_power_manager;
-struct gxp_telemetry_manager;
+struct gxp_core_telemetry_manager;
 struct gxp_thermal_manager;
 struct gxp_wakelock_manager;
+struct gxp_usage_stats;
+struct gxp_power_states;
+struct gxp_iommu_domain;
 
 struct gxp_dev {
 	struct device *dev;		 /* platform bus device */
 	struct miscdevice misc_dev;	 /* misc device structure */
 	struct dentry *d_entry;		 /* debugfs dir for this device */
 	struct gxp_mapped_resource regs; /* ioremapped CSRs */
-	struct gxp_mapped_resource mbx[GXP_NUM_CORES]; /* mailbox CSRs */
+	struct gxp_mapped_resource lpm_regs; /* ioremapped LPM CSRs, may be equal to @regs */
+	struct gxp_mapped_resource mbx[GXP_NUM_MAILBOXES]; /* mailbox CSRs */
 	struct gxp_mapped_resource fwbufs[GXP_NUM_CORES]; /* FW carveout */
 	struct gxp_mapped_resource fwdatabuf; /* Shared FW data carveout */
 	struct gxp_mapped_resource cmu; /* CMU CSRs */
 	struct gxp_mailbox_manager *mailbox_mgr;
 	struct gxp_power_manager *power_mgr;
 	struct gxp_debug_dump_manager *debug_dump_mgr;
-	const struct firmware *firmwares[GXP_NUM_CORES];
-	char *firmware_name;
-	bool is_firmware_requested;
-	/* Protects `firmwares` and `firmware_name` */
-	struct mutex dsp_firmware_lock;
-	/* Firmware status bitmap. Accessors must hold `vd_semaphore` */
-	u32 firmware_running;
+	struct gxp_firmware_manager *firmware_mgr;
 	/*
 	 * Lock to ensure only one thread at a time is ever calling
 	 * `pin_user_pages_fast()` during mapping, otherwise it will fail.
@@ -98,17 +106,150 @@ struct gxp_dev {
 	struct gxp_dma_manager *dma_mgr;
 	struct gxp_fw_data_manager *data_mgr;
 	struct gxp_tpu_dev tpu_dev;
-	struct gxp_telemetry_manager *telemetry_mgr;
+	struct gxp_core_telemetry_manager *core_telemetry_mgr;
 	struct gxp_wakelock_manager *wakelock_mgr;
+	struct gxp_iommu_domain *default_domain;
 	/*
 	 * Pointer to GSA device for firmware authentication.
 	 * May be NULL if the chip does not support firmware authentication
 	 */
 	struct device *gsa_dev;
 	u32 memory_per_core;
-	struct gxp_domain_pool *domain_pool;
+	struct gcip_domain_pool *domain_pool;
 	struct list_head client_list;
 	struct mutex client_list_lock;
+	/* Pointer and mutex of secure virtual device */
+	struct gxp_virtual_device *secure_vd;
+	struct mutex secure_vd_lock;
+	/*
+	 * Buffer shared across firmware.
+	 * Its paddr is 0 if the shared buffer is not available.
+	 * Its vaddr is always 0 as this region is not expected to be accessible
+	 * to us.
+	 */
+	struct gxp_mapped_resource shared_buf;
+	/*
+	 * If the @shared_buf is used as split slices, it will keep track of
+	 * which indexes of slices are used by ID allocator.
+	 */
+	struct ida shared_slice_idp;
+	size_t shared_slice_size; /* The size of each slice. */
+	/*
+	 * The total number of slices.
+	 * It can be zero if there is no shared buffer support.
+	 */
+	unsigned int num_shared_slices;
+	struct gxp_usage_stats *usage_stats; /* Stores the usage stats */
+
+	void __iomem *sysreg_shareability; /* sysreg shareability csr base */
+
+	/* callbacks for chip-dependent implementations */
+
+	/*
+	 * For parsing chip-dependent device tree attributes.
+	 *
+	 * Called as the first step in the common device probing procedure.
+	 *
+	 * Do NOT use non-device managed allocations in this function, to
+	 * prevent memory leak when the probe procedure fails.
+	 *
+	 * Return a non-zero value can fail the probe procedure.
+	 *
+	 * This callback is optional.
+	 */
+	int (*parse_dt)(struct platform_device *pdev, struct gxp_dev *gxp);
+	/*
+	 * Called when common device probing procedure is done.
+	 *
+	 * Return a non-zero value can fail the probe procedure.
+	 *
+	 * This callback is optional.
+	 */
+	int (*after_probe)(struct gxp_dev *gxp);
+	/*
+	 * Called before common device removal procedure.
+	 *
+	 * This callback is optional.
+	 */
+	void (*before_remove)(struct gxp_dev *gxp);
+	/*
+	 * Device ioctl handler for chip-dependent ioctl calls.
+	 * Should return -ENOTTY when the ioctl should be handled by common
+	 * device ioctl handler.
+	 *
+	 * This callback is optional.
+	 */
+	long (*handle_ioctl)(struct file *file, uint cmd, ulong arg);
+	/*
+	 * Device mmap handler for chip-dependent mmap calls.
+	 * Should return -EOPNOTSUPP when the mmap should be handled by common
+	 * device mmap handler.
+	 *
+	 * This callback is optional.
+	 */
+	int (*handle_mmap)(struct file *file, struct vm_area_struct *vma);
+	/*
+	 * Called for sending power states request.
+	 *
+	 * Return a non-zero value can fail the block wakelock acquisition.
+	 *
+	 * This callback is optional.
+	 */
+	int (*request_power_states)(struct gxp_client *client,
+				    struct gxp_power_states power_states);
+	/*
+	 * Called when the client acquired the BLOCK wakelock and allocated a virtual device.
+	 *
+	 * Return a non-zero value can fail the block acquiring.
+	 *
+	 * This callback is optional.
+	 */
+	int (*after_vd_block_ready)(struct gxp_dev *gxp,
+				    struct gxp_virtual_device *vd);
+	/*
+	 * Called before releasing the BLOCK wakelock or the virtual device.
+	 *
+	 * This callback is optional
+	 */
+	void (*before_vd_block_unready)(struct gxp_dev *gxp,
+					struct gxp_virtual_device *vd);
+	/*
+	 * Called in gxp_wakelock_acquire(), after the block is powered.
+	 *
+	 * This function is called with holding gxp_wakelock_manager.lock.
+	 *
+	 * Return a non-zero value can fail gxp_wakelock_acquire().
+	 *
+	 * This callback is optional.
+	 */
+	int (*wakelock_after_blk_on)(struct gxp_dev *gxp);
+	/*
+	 * Called in gxp_wakelock_release(), before the block is shutdown.
+	 *
+	 * This function is called with holding gxp_wakelock_manager.lock.
+	 *
+	 * This callback is optional.
+	 */
+	void (*wakelock_before_blk_off)(struct gxp_dev *gxp);
+	/*
+	 * Called in gxp_map_tpu_mbx_queue(), after the TPU mailbox buffers are mapped.
+	 *
+	 * This function is called with holding the write lock of @client->semaphore and the read
+	 * lock of @gxp->vd_semaphore.
+	 *
+	 * This callback is optional.
+	 */
+	int (*after_map_tpu_mbx_queue)(struct gxp_dev *gxp,
+				       struct gxp_client *client);
+	/*
+	 * Called in gxp_unmap_tpu_mbx_queue(), before unmapping the TPU mailbox buffers.
+	 *
+	 * This function is called with holding the write lock of @client->semaphore.
+	 *
+	 * This callback is optional.
+	 */
+	void (*before_unmap_tpu_mbx_queue)(struct gxp_dev *gxp,
+					   struct gxp_client *client);
 };
 
 /* GXP device IO functions */
@@ -121,22 +262,6 @@ static inline u32 gxp_read_32(struct gxp_dev *gxp, uint reg_offset)
 static inline void gxp_write_32(struct gxp_dev *gxp, uint reg_offset, u32 value)
 {
 	writel(value, gxp->regs.vaddr + reg_offset);
-}
-
-static inline u32 gxp_read_32_core(struct gxp_dev *gxp, uint core,
-				   uint reg_offset)
-{
-	uint offset = GXP_CORE_0_BASE + (GXP_CORE_SIZE * core) + reg_offset;
-
-	return gxp_read_32(gxp, offset);
-}
-
-static inline void gxp_write_32_core(struct gxp_dev *gxp, uint core,
-				     uint reg_offset, u32 value)
-{
-	uint offset = GXP_CORE_0_BASE + (GXP_CORE_SIZE * core) + reg_offset;
-
-	gxp_write_32(gxp, offset, value);
 }
 
 static inline int gxp_acquire_rmem_resource(struct gxp_dev *gxp,
@@ -157,5 +282,16 @@ static inline int gxp_acquire_rmem_resource(struct gxp_dev *gxp,
 
 	return ret;
 }
+
+/*
+ * To specify whether AP and DSP cores directly communicate by the core mailboxes.
+ * All platform drivers of each chip should implement this.
+ */
+bool gxp_is_direct_mode(struct gxp_dev *gxp);
+
+/*
+ * Returns the chip revision.
+ */
+enum gxp_chip_revision gxp_get_chip_revision(struct gxp_dev *gxp);
 
 #endif /* __GXP_INTERNAL_H__ */

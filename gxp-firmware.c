@@ -17,6 +17,8 @@
 #include <linux/types.h>
 
 #include "gxp-bpm.h"
+#include "gxp-config.h"
+#include "gxp-core-telemetry.h"
 #include "gxp-debug-dump.h"
 #include "gxp-doorbell.h"
 #include "gxp-firmware.h"
@@ -26,17 +28,20 @@
 #include "gxp-mailbox.h"
 #include "gxp-notification.h"
 #include "gxp-pm.h"
-#include "gxp-telemetry.h"
 #include "gxp-vd.h"
 
-/* Files need to be copied to /lib/firmware */
-#define DSP_FIRMWARE_DEFAULT_PREFIX	"gxp_fw_core"
+#if IS_ENABLED(CONFIG_GXP_TEST)
+#include "unittests/factory/fake-gxp-firmware.h"
+#endif
 
 #define FW_HEADER_SIZE		(0x1000)
 #define FW_IMAGE_TYPE_OFFSET	(0x400)
 
 static int gxp_dsp_fw_auth_disable;
 module_param_named(dsp_fw_auth_disable, gxp_dsp_fw_auth_disable, int, 0660);
+
+static bool gxp_core_boot = true;
+module_param_named(core_boot, gxp_core_boot, bool, 0660);
 
 static int
 request_dsp_firmware(struct gxp_dev *gxp, char *name_prefix,
@@ -92,59 +97,19 @@ static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 	ehdr = (struct elf32_hdr *)elf_data;
 	phdr = (struct elf32_phdr *)(elf_data + ehdr->e_phoff);
 
-	if ((ehdr->e_ident[EI_MAG0] != ELFMAG0) ||
-	    (ehdr->e_ident[EI_MAG1] != ELFMAG1) ||
-	    (ehdr->e_ident[EI_MAG2] != ELFMAG2) ||
-	    (ehdr->e_ident[EI_MAG3] != ELFMAG3)) {
-		dev_err(gxp->dev, "Cannot load FW! Invalid ELF format.\n");
-		return -EINVAL;
-	}
-
 	/* go through the available ELF segments */
 	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
-		u64 da = phdr->p_paddr;
-		u32 memsz = phdr->p_memsz;
-		u32 filesz = phdr->p_filesz;
-		u32 offset = phdr->p_offset;
+		const u64 da = phdr->p_paddr;
+		const u32 memsz = phdr->p_memsz;
+		const u32 filesz = phdr->p_filesz;
 		void *ptr;
 
-		if (phdr->p_type != PT_LOAD)
+		if (phdr->p_type != PT_LOAD || !phdr->p_flags || !memsz)
 			continue;
 
-		if (!phdr->p_flags)
+		if (!(da >= buffer->daddr &&
+		      da + memsz <= buffer->daddr + buffer->size))
 			continue;
-
-		if (!memsz)
-			continue;
-
-		if (!((da >= (u32)buffer->daddr) &&
-		   ((da + memsz) <= ((u32)buffer->daddr +
-				     (u32)buffer->size)))) {
-			/*
-			 * Some BSS data may be referenced from TCM, and can be
-			 * skipped while loading
-			 */
-			dev_err(gxp->dev, "Segment out of bounds: da 0x%llx mem 0x%x. Skipping...\n",
-				da, memsz);
-			continue;
-		}
-
-		dev_notice(gxp->dev, "phdr: type %d da 0x%llx memsz 0x%x filesz 0x%x\n",
-			   phdr->p_type, da, memsz, filesz);
-
-		if (filesz > memsz) {
-			dev_err(gxp->dev, "Bad phdr filesz 0x%x memsz 0x%x\n",
-				filesz, memsz);
-			ret = -EINVAL;
-			break;
-		}
-
-		if (offset + filesz > size) {
-			dev_err(gxp->dev, "Truncated fw: need 0x%x avail 0x%zx\n",
-				offset + filesz, size);
-			ret = -EINVAL;
-			break;
-		}
 
 		/* grab the kernel address for this device address */
 		ptr = buffer->vaddr + (da - buffer->daddr);
@@ -167,6 +132,15 @@ static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 	}
 
 	return ret;
+}
+
+static void elf_fetch_entry_point(struct gxp_dev *gxp, const u8 *elf_data,
+				  uint core)
+{
+	struct elf32_hdr *ehdr;
+
+	ehdr = (struct elf32_hdr *)elf_data;
+	gxp->firmware_mgr->entry_points[core] = ehdr->e_entry;
 }
 
 static int
@@ -258,6 +232,112 @@ error:
 	return ret;
 }
 
+static int gxp_firmware_fetch_boundary(struct gxp_dev *gxp, const u8 *elf_data,
+				       size_t size,
+				       const struct gxp_mapped_resource *buffer,
+				       dma_addr_t *boundary_ptr)
+{
+	struct elf32_hdr *ehdr = (struct elf32_hdr *)elf_data;
+	struct elf32_phdr *phdr = (struct elf32_phdr *)(elf_data + ehdr->e_phoff);
+	int i, ret = 0;
+	dma_addr_t boundary = 0;
+
+	if ((ehdr->e_ident[EI_MAG0] != ELFMAG0) ||
+	    (ehdr->e_ident[EI_MAG1] != ELFMAG1) ||
+	    (ehdr->e_ident[EI_MAG2] != ELFMAG2) ||
+	    (ehdr->e_ident[EI_MAG3] != ELFMAG3)) {
+		dev_err(gxp->dev, "Invalid ELF format.");
+		return -EINVAL;
+	}
+
+	/* go through the available ELF segments */
+	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
+		const u64 da = phdr->p_paddr;
+		const u32 memsz = phdr->p_memsz;
+		const u32 filesz = phdr->p_filesz;
+		const u32 offset = phdr->p_offset;
+		const u32 p_flags = phdr->p_flags;
+
+		if (phdr->p_type != PT_LOAD || !p_flags || !memsz)
+			continue;
+
+		if (!(da >= buffer->daddr &&
+		      da + memsz <= buffer->daddr + buffer->size)) {
+			/*
+			 * Some BSS data may be referenced from TCM, and can be
+			 * skipped while loading
+			 */
+			dev_err(gxp->dev, "Segment out of bounds: da 0x%llx mem 0x%x. Skipping...",
+				da, memsz);
+			continue;
+		}
+
+		dev_info(gxp->dev,
+			 "phdr: da %#llx memsz %#x filesz %#x perm %d", da,
+			 memsz, filesz, p_flags);
+
+		if (filesz > memsz) {
+			dev_err(gxp->dev, "Bad phdr filesz %#x memsz %#x",
+				filesz, memsz);
+			ret = -EINVAL;
+			break;
+		}
+
+		if (offset + filesz > size) {
+			dev_err(gxp->dev, "Truncated fw: need %#x avail %#zx",
+				offset + filesz, size);
+			ret = -EINVAL;
+			break;
+		}
+		if (p_flags & PF_W) {
+			if (!boundary)
+				boundary = da;
+		} else if (boundary) {
+			dev_err(gxp->dev,
+				"Found RO region after a writable segment");
+			ret = -EINVAL;
+			break;
+		}
+	}
+	/* no boundary has been found - assume the whole image is RO */
+	if (!boundary)
+		boundary = buffer->daddr + buffer->size;
+	if (!ret)
+		*boundary_ptr = boundary;
+
+	return ret;
+}
+
+/*
+ * Sets @rw_boundaries by analyzing LOAD segments in ELF headers.
+ *
+ * Assumes the LOAD segments are arranged with RO first then RW. Returns -EINVAL
+ * if this is not true.
+ */
+static int gxp_firmware_fetch_boundaries(struct gxp_dev *gxp,
+					 struct gxp_firmware_manager *mgr)
+{
+	int core, ret;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		ret = gxp_firmware_fetch_boundary(
+			gxp, mgr->firmwares[core]->data + FW_HEADER_SIZE,
+			mgr->firmwares[core]->size - FW_HEADER_SIZE,
+			&gxp->fwbufs[core], &mgr->rw_boundaries[core]);
+		if (ret) {
+			dev_err(gxp->dev,
+				"failed to fetch boundary of core %d: %d", core,
+				ret);
+			goto error;
+		}
+	}
+	return 0;
+
+error:
+	memset(mgr->rw_boundaries, 0, sizeof(mgr->rw_boundaries));
+	return ret;
+}
+
 /* Forward declaration for usage inside gxp_firmware_load(..). */
 static void gxp_firmware_unload(struct gxp_dev *gxp, uint core);
 
@@ -265,38 +345,42 @@ static void gxp_program_reset_vector(struct gxp_dev *gxp, uint core, bool verbos
 {
 	u32 reset_vec;
 
-	reset_vec = gxp_read_32_core(gxp, core,
-				     GXP_REG_ALT_RESET_VECTOR);
+	reset_vec = gxp_read_32(gxp, GXP_CORE_REG_ALT_RESET_VECTOR(core));
 	if (verbose)
 		dev_notice(gxp->dev,
 			   "Current Aurora reset vector for core %u: 0x%x\n",
 			   core, reset_vec);
-	gxp_write_32_core(gxp, core, GXP_REG_ALT_RESET_VECTOR,
-			  gxp->fwbufs[core].daddr);
+	gxp_write_32(gxp, GXP_CORE_REG_ALT_RESET_VECTOR(core),
+		     gxp->firmware_mgr->entry_points[core]);
 	if (verbose)
 		dev_notice(gxp->dev,
-			   "New Aurora reset vector for core %u: 0x%llx\n",
-			   core, gxp->fwbufs[core].daddr);
+			   "New Aurora reset vector for core %u: 0x%x\n",
+			   core, gxp->firmware_mgr->entry_points[core]);
 }
 
 static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 {
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
 	u32 offset;
 	void __iomem *core_scratchpad_base;
 	int ret;
 
-	if (!gxp->firmwares[core])
+	if (!mgr->firmwares[core])
 		return -ENODEV;
 
 	/* Load firmware to System RAM */
 	ret = elf_load_segments(gxp,
-				gxp->firmwares[core]->data + FW_HEADER_SIZE,
-				gxp->firmwares[core]->size - FW_HEADER_SIZE,
+				mgr->firmwares[core]->data + FW_HEADER_SIZE,
+				mgr->firmwares[core]->size - FW_HEADER_SIZE,
 				&gxp->fwbufs[core]);
 	if (ret) {
 		dev_err(gxp->dev, "Unable to load elf file\n");
 		goto out_firmware_unload;
 	}
+
+	elf_fetch_entry_point(gxp,
+			      mgr->firmwares[core]->data + FW_HEADER_SIZE,
+			      core);
 
 	memset(gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF, 0,
 	       AURORA_SCRATCHPAD_LEN);
@@ -326,7 +410,7 @@ out_firmware_unload:
 static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 {
 	u32 offset;
-	u32 expected_top_value;
+	u32 __maybe_unused expected_top_value;
 	void __iomem *core_scratchpad_base;
 	int ctr;
 
@@ -334,7 +418,7 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	dev_notice(gxp->dev, "Waiting for core %u to power up...\n", core);
 	ctr = 1000;
 	while (ctr) {
-		if (gxp_lpm_is_powered(gxp, core))
+		if (gxp_lpm_is_powered(gxp, CORE_TO_PSM(core)))
 			break;
 		udelay(1 * GXP_TIME_DELAY_FACTOR);
 		ctr--;
@@ -359,6 +443,15 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 */
 	ctr = 5000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_CORE_ALIVE);
+#if IS_ENABLED(CONFIG_GXP_TEST)
+	fake_gxp_firmware_flush_work_all();
+	/*
+	 * As the fake firmware works are flushed, we don't have to busy-wait the response of
+	 * the firmware. By setting @ctr to 1, just run the while loop below once for the code
+	 * coverage.
+	 */
+	ctr = 1;
+#endif
 	usleep_range(50 * GXP_TIME_DELAY_FACTOR, 60 * GXP_TIME_DELAY_FACTOR);
 	while (ctr--) {
 		if (readl(core_scratchpad_base + offset) == Q7_ALIVE_MAGIC)
@@ -437,15 +530,16 @@ static ssize_t load_dsp_firmware_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
 	struct gxp_dev *gxp = dev_get_drvdata(dev);
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
 	ssize_t ret;
 
-	mutex_lock(&gxp->dsp_firmware_lock);
+	mutex_lock(&mgr->dsp_firmware_lock);
 
 	ret = scnprintf(buf, PAGE_SIZE, "%s\n",
-			gxp->firmware_name ? gxp->firmware_name :
+			mgr->firmware_name ? mgr->firmware_name :
 					     DSP_FIRMWARE_DEFAULT_PREFIX);
 
-	mutex_unlock(&gxp->dsp_firmware_lock);
+	mutex_unlock(&mgr->dsp_firmware_lock);
 
 	return ret;
 }
@@ -455,6 +549,7 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 				       const char *buf, size_t count)
 {
 	struct gxp_dev *gxp = dev_get_drvdata(dev);
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
 	const struct firmware *firmwares[GXP_NUM_CORES];
 	char *name_buf = NULL;
 	int ret;
@@ -466,10 +561,10 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 	 */
 	down_read(&gxp->vd_semaphore);
 
-	if (gxp->firmware_running) {
+	if (mgr->firmware_running) {
 		dev_warn(dev, "Cannot update firmware when any core is running\n");
 		ret = -EBUSY;
-		goto out;
+		goto err_out;
 	}
 
 	name_buf = fw_name_from_attr_buf(buf);
@@ -477,10 +572,10 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 		dev_err(gxp->dev, "Invalid firmware prefix requested: %s\n",
 			buf);
 		ret = PTR_ERR(name_buf);
-		goto out;
+		goto err_out;
 	}
 
-	mutex_lock(&gxp->dsp_firmware_lock);
+	mutex_lock(&mgr->dsp_firmware_lock);
 
 	dev_notice(gxp->dev, "Requesting firmware be reloaded: %s\n", name_buf);
 
@@ -497,25 +592,32 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 		goto err_authenticate_firmware;
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
-		if (gxp->firmwares[core])
-			release_firmware(gxp->firmwares[core]);
-		gxp->firmwares[core] = firmwares[core];
+		if (mgr->firmwares[core])
+			release_firmware(mgr->firmwares[core]);
+		mgr->firmwares[core] = firmwares[core];
 	}
 
-	kfree(gxp->firmware_name);
-	gxp->firmware_name = name_buf;
+	ret = gxp_firmware_fetch_boundaries(gxp, mgr);
+	if (ret)
+		goto err_fetch_boundaries;
 
-	mutex_unlock(&gxp->dsp_firmware_lock);
-out:
+	kfree(mgr->firmware_name);
+	mgr->firmware_name = name_buf;
+
+	mutex_unlock(&mgr->dsp_firmware_lock);
 	up_read(&gxp->vd_semaphore);
 	return count;
 
+err_fetch_boundaries:
+	for (core = 0; core < GXP_NUM_CORES; core++)
+		mgr->firmwares[core] = NULL;
 err_authenticate_firmware:
 	for (core = 0; core < GXP_NUM_CORES; core++)
 		release_firmware(firmwares[core]);
 err_request_firmware:
 	kfree(name_buf);
-	mutex_unlock(&gxp->dsp_firmware_lock);
+	mutex_unlock(&mgr->dsp_firmware_lock);
+err_out:
 	up_read(&gxp->vd_semaphore);
 	return ret;
 }
@@ -537,6 +639,13 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	uint core;
 	struct resource r;
 	int ret;
+	struct gxp_firmware_manager *mgr;
+
+	mgr = devm_kzalloc(gxp->dev, sizeof(*mgr), GFP_KERNEL);
+	if (!mgr)
+		return -ENOMEM;
+	gxp->firmware_mgr = mgr;
+	mutex_init(&mgr->dsp_firmware_lock);
 
 	/* Power on BLK_AUR to read the revision and processor ID registers */
 	gxp_pm_blk_on(gxp);
@@ -545,7 +654,7 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	dev_notice(gxp->dev, "Aurora version: 0x%x\n", ver);
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
-		proc_id = gxp_read_32_core(gxp, core, GXP_REG_PROCESSOR_ID);
+		proc_id = gxp_read_32(gxp, GXP_CORE_REG_PROCESSOR_ID(core));
 		dev_notice(gxp->dev, "Aurora core %u processor ID: 0x%x\n",
 			   core, proc_id);
 	}
@@ -609,7 +718,7 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	if (ret)
 		goto out_fw_destroy;
 
-	gxp->firmware_running = 0;
+	mgr->firmware_running = 0;
 	return 0;
 
 out_fw_destroy:
@@ -620,6 +729,10 @@ out_fw_destroy:
 void gxp_fw_destroy(struct gxp_dev *gxp)
 {
 	uint core;
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
+
+	if (IS_GXP_TEST && !mgr)
+		return;
 
 	device_remove_group(gxp->dev, &gxp_firmware_attr_group);
 
@@ -629,54 +742,83 @@ void gxp_fw_destroy(struct gxp_dev *gxp)
 			gxp->fwbufs[core].vaddr = NULL;
 		}
 
-		if (gxp->firmwares[core]) {
-			release_firmware(gxp->firmwares[core]);
-			gxp->firmwares[core] = NULL;
+		if (mgr->firmwares[core]) {
+			release_firmware(mgr->firmwares[core]);
+			mgr->firmwares[core] = NULL;
 		}
 	}
 
-	kfree(gxp->firmware_name);
+	kfree(mgr->firmware_name);
 }
 
 int gxp_firmware_request_if_needed(struct gxp_dev *gxp)
 {
 	int ret = 0;
 	uint core;
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
+	char *name = NULL;
 
-	mutex_lock(&gxp->dsp_firmware_lock);
+	mutex_lock(&mgr->dsp_firmware_lock);
 
-	if (gxp->is_firmware_requested)
+	if (mgr->is_firmware_requested)
 		goto out;
 
-	ret = request_dsp_firmware(gxp, DSP_FIRMWARE_DEFAULT_PREFIX,
-				   gxp->firmwares);
+	if (mgr->firmware_name == NULL)
+		name = DSP_FIRMWARE_DEFAULT_PREFIX;
+	else
+		name = mgr->firmware_name;
+
+	ret = request_dsp_firmware(gxp, name, mgr->firmwares);
 	if (ret)
 		goto out;
 
-	ret = gxp_firmware_authenticate(gxp, gxp->firmwares);
+	ret = gxp_firmware_authenticate(gxp, mgr->firmwares);
 	if (ret)
 		goto err_authenticate_firmware;
 
-	gxp->is_firmware_requested = true;
+	ret = gxp_firmware_fetch_boundaries(gxp, mgr);
+	if (ret)
+		goto err_authenticate_firmware;
+
+	mgr->is_firmware_requested = true;
 
 out:
-	mutex_unlock(&gxp->dsp_firmware_lock);
+	mutex_unlock(&mgr->dsp_firmware_lock);
 	return ret;
 
 err_authenticate_firmware:
 	for (core = 0; core < GXP_NUM_CORES; core++) {
-		release_firmware(gxp->firmwares[core]);
-		gxp->firmwares[core] = NULL;
+		release_firmware(mgr->firmwares[core]);
+		mgr->firmwares[core] = NULL;
 	}
-	mutex_unlock(&gxp->dsp_firmware_lock);
+	mutex_unlock(&mgr->dsp_firmware_lock);
 	return ret;
+}
+
+/* TODO(b/253464747): Refactor these interrupts handlers and gxp-doorbell.c. */
+static void enable_core_interrupts(struct gxp_dev *gxp, uint core)
+{
+	/*
+	 * GXP_CORE_REG_COMMON_INT_MASK_0 is handled in doorbell module, so we
+	 * don't need to enable it here.
+	 */
+	gxp_write_32(gxp, GXP_CORE_REG_COMMON_INT_MASK_1(core), 0xffffffff);
+	gxp_write_32(gxp, GXP_CORE_REG_DEDICATED_INT_MASK(core), 0xffffffff);
+}
+
+static void disable_core_interrupts(struct gxp_dev *gxp, uint core)
+{
+	gxp_write_32(gxp, GXP_CORE_REG_COMMON_INT_MASK_0(core), 0);
+	gxp_write_32(gxp, GXP_CORE_REG_COMMON_INT_MASK_1(core), 0);
+	gxp_write_32(gxp, GXP_CORE_REG_DEDICATED_INT_MASK(core), 0);
 }
 
 static int gxp_firmware_setup(struct gxp_dev *gxp, uint core)
 {
 	int ret = 0;
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
 
-	if (gxp->firmware_running & BIT(core)) {
+	if (mgr->firmware_running & BIT(core)) {
 		dev_err(gxp->dev, "Firmware is already running on core %u\n",
 			core);
 		return -EBUSY;
@@ -689,15 +831,19 @@ static int gxp_firmware_setup(struct gxp_dev *gxp, uint core)
 	}
 
 	/* Mark this as a cold boot */
-	gxp_firmware_set_boot_mode(gxp, core, GXP_BOOT_MODE_REQUEST_COLD_BOOT);
+	if (gxp_core_boot)
+		gxp_firmware_set_boot_mode(gxp, core,
+					   GXP_BOOT_MODE_REQUEST_COLD_BOOT);
 
 	ret = gxp_firmware_setup_hw_after_block_off(gxp, core,
 						    /*verbose=*/true);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to power up core %u\n", core);
 		gxp_firmware_unload(gxp, core);
+		return ret;
 	}
 
+	enable_core_interrupts(gxp, core);
 	return ret;
 }
 
@@ -721,27 +867,35 @@ static int gxp_firmware_finish_startup(struct gxp_dev *gxp,
 				       struct gxp_virtual_device *vd,
 				       uint virt_core, uint core)
 {
-	int ret;
 	struct work_struct *work;
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
+	int ret = 0;
 
-	ret = gxp_firmware_handshake(gxp, core);
-	if (ret) {
-		dev_err(gxp->dev, "Firmware handshake failed on core %u\n",
-			core);
-		gxp_pm_core_off(gxp, core);
-		goto out_firmware_unload;
-	}
+	if (gxp_core_boot) {
+		ret = gxp_firmware_handshake(gxp, core);
+		if (ret) {
+			dev_err(gxp->dev,
+				"Firmware handshake failed on core %u\n", core);
+			goto err_firmware_off;
+		}
 
-	/* Initialize mailbox */
-	gxp->mailbox_mgr->mailboxes[core] =
-		gxp_mailbox_alloc(gxp->mailbox_mgr, vd, virt_core, core);
-	if (IS_ERR(gxp->mailbox_mgr->mailboxes[core])) {
-		dev_err(gxp->dev,
-			"Unable to allocate mailbox (core=%u, ret=%ld)\n", core,
-			PTR_ERR(gxp->mailbox_mgr->mailboxes[core]));
-		ret = PTR_ERR(gxp->mailbox_mgr->mailboxes[core]);
-		gxp->mailbox_mgr->mailboxes[core] = NULL;
-		goto out_firmware_unload;
+		/* Initialize mailbox */
+		if (gxp->mailbox_mgr->allocate_mailbox) {
+			gxp->mailbox_mgr->mailboxes[core] =
+				gxp->mailbox_mgr->allocate_mailbox(
+					gxp->mailbox_mgr, vd, virt_core, core);
+			if (IS_ERR(gxp->mailbox_mgr->mailboxes[core])) {
+				dev_err(gxp->dev,
+					"Unable to allocate mailbox (core=%u, ret=%ld)\n",
+					core,
+					PTR_ERR(gxp->mailbox_mgr
+							->mailboxes[core]));
+				ret = PTR_ERR(
+					gxp->mailbox_mgr->mailboxes[core]);
+				gxp->mailbox_mgr->mailboxes[core] = NULL;
+				goto err_firmware_off;
+			}
+		}
 	}
 
 	work = gxp_debug_dump_get_notification_handler(gxp, core);
@@ -749,16 +903,18 @@ static int gxp_firmware_finish_startup(struct gxp_dev *gxp,
 		gxp_notification_register_handler(
 			gxp, core, HOST_NOTIF_DEBUG_DUMP_READY, work);
 
-	work = gxp_telemetry_get_notification_handler(gxp, core);
+	work = gxp_core_telemetry_get_notification_handler(gxp, core);
 	if (work)
 		gxp_notification_register_handler(
-			gxp, core, HOST_NOTIF_TELEMETRY_STATUS, work);
+			gxp, core, HOST_NOTIF_CORE_TELEMETRY_STATUS, work);
 
-	gxp->firmware_running |= BIT(core);
+	mgr->firmware_running |= BIT(core);
 
 	return ret;
 
-out_firmware_unload:
+err_firmware_off:
+	if (gxp_core_boot)
+		gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);
 	return ret;
 }
@@ -767,22 +923,36 @@ static void gxp_firmware_stop_core(struct gxp_dev *gxp,
 				   struct gxp_virtual_device *vd,
 				   uint virt_core, uint core)
 {
-	if (!(gxp->firmware_running & BIT(core)))
+	struct gxp_firmware_manager *mgr = gxp->firmware_mgr;
+
+	if (!(mgr->firmware_running & BIT(core)))
 		dev_err(gxp->dev, "Firmware is not running on core %u\n", core);
 
-	gxp->firmware_running &= ~BIT(core);
+	mgr->firmware_running &= ~BIT(core);
 
 	gxp_notification_unregister_handler(gxp, core,
 					    HOST_NOTIF_DEBUG_DUMP_READY);
 	gxp_notification_unregister_handler(gxp, core,
-					    HOST_NOTIF_TELEMETRY_STATUS);
+					    HOST_NOTIF_CORE_TELEMETRY_STATUS);
 
-	gxp_mailbox_release(gxp->mailbox_mgr, vd, virt_core,
-			    gxp->mailbox_mgr->mailboxes[core]);
-	dev_notice(gxp->dev, "Mailbox %u released\n", core);
+	if (gxp_core_boot) {
+		if (gxp->mailbox_mgr->release_mailbox) {
+			gxp->mailbox_mgr->release_mailbox(
+				gxp->mailbox_mgr, vd, virt_core,
+				gxp->mailbox_mgr->mailboxes[core]);
+			dev_notice(gxp->dev, "Mailbox %u released\n", core);
+		}
 
-	if (vd->state == GXP_VD_RUNNING)
-		gxp_pm_core_off(gxp, core);
+		if (vd->state == GXP_VD_RUNNING) {
+			/*
+			 * Disable interrupts to prevent cores from being woken up
+			 * unexpectedly.
+			 */
+			disable_core_interrupts(gxp, core);
+			gxp_pm_core_off(gxp, core);
+		}
+	}
+
 	gxp_firmware_unload(gxp, core);
 }
 
@@ -813,7 +983,8 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 		for (core = 0; core < GXP_NUM_CORES; core++) {
 			if (core_list & BIT(core)) {
 				if (!(failed_cores & BIT(core))) {
-					gxp_pm_core_off(gxp, core);
+					if (gxp_core_boot)
+						gxp_pm_core_off(gxp, core);
 					gxp_firmware_unload(gxp, core);
 				}
 			}
@@ -834,8 +1005,11 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	}
 #endif
 	/* Switch clock mux to the normal state to guarantee LPM works */
-	gxp_pm_force_clkmux_normal(gxp);
-	gxp_firmware_wakeup_cores(gxp, core_list);
+	if (gxp_core_boot) {
+		gxp_pm_force_clkmux_normal(gxp);
+		gxp_firmware_wakeup_cores(gxp, core_list);
+	}
+
 	virt_core = 0;
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (core_list & BIT(core)) {
@@ -864,7 +1038,8 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 		}
 	}
 	/* Check if we need to set clock mux to low state as requested */
-	gxp_pm_resume_clkmux(gxp);
+	if (gxp_core_boot)
+		gxp_pm_resume_clkmux(gxp);
 
 	return ret;
 }
@@ -873,7 +1048,8 @@ int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
 					  bool verbose)
 {
 	gxp_program_reset_vector(gxp, core, verbose);
-	return gxp_pm_core_on(gxp, core, verbose);
+
+	return gxp_core_boot ? gxp_pm_core_on(gxp, core, verbose) : 0;
 }
 
 

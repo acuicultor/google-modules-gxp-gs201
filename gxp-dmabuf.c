@@ -8,9 +8,11 @@
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #include "gxp-dma.h"
 #include "gxp-dmabuf.h"
+#include "gxp-vd.h"
 
 struct gxp_dmabuf_mapping {
 	struct gxp_mapping mapping;
@@ -34,13 +36,12 @@ static void destroy_dmabuf_mapping(struct gxp_mapping *mapping)
 {
 	struct gxp_dmabuf_mapping *dmabuf_mapping;
 	struct gxp_dev *gxp = mapping->gxp;
-	struct gxp_virtual_device *vd = mapping->vd;
 
 	/* Unmap and detach the dma-buf */
 	dmabuf_mapping =
 		container_of(mapping, struct gxp_dmabuf_mapping, mapping);
 
-	gxp_dma_unmap_dmabuf_attachment(gxp, vd, mapping->virt_core_list,
+	gxp_dma_unmap_dmabuf_attachment(gxp, mapping->domain,
 					dmabuf_mapping->attachment,
 					dmabuf_mapping->sgt, mapping->dir);
 	dma_buf_detach(dmabuf_mapping->dmabuf, dmabuf_mapping->attachment);
@@ -50,9 +51,8 @@ static void destroy_dmabuf_mapping(struct gxp_mapping *mapping)
 }
 
 struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
-				   struct gxp_virtual_device *vd,
-				   uint virt_core_list, int fd, u32 flags,
-				   enum dma_data_direction dir)
+				   struct gxp_iommu_domain *domain, int fd,
+				   u32 flags, enum dma_data_direction dir)
 {
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attachment;
@@ -78,7 +78,7 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 		goto err_attach;
 	}
 
-	sgt = gxp_dma_map_dmabuf_attachment(gxp, vd, virt_core_list, attachment, dir);
+	sgt = gxp_dma_map_dmabuf_attachment(gxp, domain, attachment, dir);
 	if (IS_ERR(sgt)) {
 		dev_err(gxp->dev,
 			"Failed to map dma-buf attachment (ret=%ld)\n",
@@ -98,8 +98,7 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 	dmabuf_mapping->mapping.destructor = destroy_dmabuf_mapping;
 	dmabuf_mapping->mapping.host_address = 0;
 	dmabuf_mapping->mapping.gxp = gxp;
-	dmabuf_mapping->mapping.virt_core_list = virt_core_list;
-	dmabuf_mapping->mapping.vd = vd;
+	dmabuf_mapping->mapping.domain = domain;
 	dmabuf_mapping->mapping.device_address = sg_dma_address(sgt->sgl);
 	dmabuf_mapping->mapping.dir = dir;
 	dmabuf_mapping->dmabuf = dmabuf;
@@ -109,10 +108,14 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 	return &dmabuf_mapping->mapping;
 
 err_alloc_mapping:
-	gxp_dma_unmap_dmabuf_attachment(gxp, vd, virt_core_list, attachment, sgt, dir);
+	gxp_dma_unmap_dmabuf_attachment(gxp, domain, attachment, sgt, dir);
 err_map_attachment:
 	dma_buf_detach(dmabuf, attachment);
 err_attach:
 	dma_buf_put(dmabuf);
 	return ERR_PTR(ret);
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+MODULE_IMPORT_NS(DMA_BUF);
+#endif

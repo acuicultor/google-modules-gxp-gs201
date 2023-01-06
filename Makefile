@@ -3,31 +3,54 @@
 # Makefile for GXP driver.
 #
 
-obj-$(CONFIG_GXP) += gxp.o
+GXP_CHIP ?= AMALTHEA
+CONFIG_$(GXP_CHIP) ?= m
+GCIP_DIR := gcip-kernel-driver/drivers/gcip
 
-gxp-objs +=	\
+obj-$(CONFIG_$(GXP_CHIP)) += gxp.o
+
+gxp-objs += \
 		gxp-bpm.o \
 		gxp-client.o \
+		gxp-core-telemetry.o \
 		gxp-debug-dump.o \
 		gxp-debugfs.o \
+		gxp-dma-iommu.o \
 		gxp-dmabuf.o \
 		gxp-domain-pool.o \
 		gxp-doorbell.o \
 		gxp-eventfd.o \
-		gxp-firmware.o \
 		gxp-firmware-data.o \
-		gxp-hw-mailbox-driver.o \
+		gxp-firmware.o \
 		gxp-lpm.o \
+		gxp-mailbox-manager.o \
 		gxp-mailbox.o \
 		gxp-mapping.o \
 		gxp-mb-notification.o \
-		gxp-platform.o \
-		gxp-range-alloc.o \
 		gxp-pm.o \
-		gxp-telemetry.o \
+		gxp-range-alloc.o \
+		gxp-ssmt.o \
 		gxp-thermal.o \
 		gxp-vd.o \
 		gxp-wakelock.o
+
+ifeq ($(GXP_CHIP),AMALTHEA)
+
+gxp-objs +=	\
+		gsx01-mailbox-driver.o \
+		gxp-platform.o \
+		gxp-mailbox-impl.o
+
+GMODULE_PATH := $(OUT_DIR)/../google-modules
+EDGETPU_CHIP := janeiro
+
+endif
+
+ifeq ($(CONFIG_$(GXP_CHIP)),m)
+
+gxp-objs += $(GCIP_DIR)/gcip.o
+
+endif
 
 KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
 M ?= $(shell pwd)
@@ -44,35 +67,29 @@ endif
 # If building via make directly, specify target platform by adding
 #     "GXP_PLATFORM=<target>"
 # With one of the following values:
-#     - CLOUDRIPPER
+#     - SILICON
 #     - ZEBU
 #     - IP_ZEBU
-# Defaults to building for CLOUDRIPPER if not otherwise specified.
-GXP_PLATFORM ?= CLOUDRIPPER
-GXP_CHIP ?= AMALTHEA
+#     - GEM5
+# Defaults to building for SILICON if not otherwise specified.
+GXP_PLATFORM ?= SILICON
 
-# Setup which version of the gxp-dma interface is used.
-# For gem5, need to adopt dma interface without aux domain.
-ifeq ($(GXP_PLATFORM), GEM5)
-	gxp-objs += gxp-dma-iommu-gem5.o
-else
-	gxp-objs += gxp-dma-iommu.o
-endif
+gxp-flags := -DCONFIG_GXP_$(GXP_PLATFORM) -DCONFIG_$(GXP_CHIP)=1 \
+	     -I$(M)/include -I$(M)/gcip-kernel-driver/include \
+	     -I$(srctree)/$(M)/include \
+	     -I$(srctree)/$(M)/gcip-kernel-driver/include \
+	     -I$(srctree)/drivers/gxp/include
+ccflags-y += $(EXTRA_CFLAGS) $(gxp-flags)
 
-ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM) -DCONFIG_$(GXP_CHIP)=1 \
-	     -I$(M)/include -I$(srctree)/drivers/gxp/include
-
-KBUILD_OPTIONS += CONFIG_GXP=m GXP_CHIP=AMALTHEA
-
-ifdef CONFIG_GXP_TEST
-subdir-ccflags-y        += -Wall -Werror -I$(srctree)/drivers/gxp/include
-obj-y           += unittests/
-include $(srctree)/drivers/gxp/unittests/Makefile.include
-$(call include_test_path, $(gxp-objs))
-endif
+KBUILD_OPTIONS += GXP_CHIP=$(GXP_CHIP) GXP_PLATFORM=$(GXP_PLATFORM)
 
 # Access TPU driver's exported symbols.
-KBUILD_EXTRA_SYMBOLS += ../google-modules/edgetpu/janeiro/drivers/edgetpu/Module.symvers
+EXTRA_SYMBOLS += $(GMODULE_PATH)/edgetpu/$(EDGETPU_CHIP)/drivers/edgetpu/Module.symvers
 
-modules modules_install clean:
+modules modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M)/$(GCIP_DIR) gcip.o
+	$(MAKE) -C $(KERNEL_SRC) M=$(M) W=1 $(KBUILD_OPTIONS) \
+	EXTRA_CFLAGS="$(EXTRA_CFLAGS)" KBUILD_EXTRA_SYMBOLS="$(EXTRA_SYMBOLS)" $(@)
+clean:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M)/$(GCIP_DIR) $(@)
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) W=1 $(KBUILD_OPTIONS) $(@)

@@ -15,7 +15,6 @@
 #include "gxp-dma.h"
 #include "gxp-internal.h"
 #include "gxp-mapping.h"
-#include "mm-backport.h"
 
 /* Destructor for a mapping created with `gxp_mapping_create()` */
 static void destroy_mapping(struct gxp_mapping *mapping)
@@ -35,9 +34,9 @@ static void destroy_mapping(struct gxp_mapping *mapping)
 	 * user requires a mapping be synced before unmapping, they are
 	 * responsible for calling `gxp_mapping_sync()` before hand.
 	 */
-	gxp_dma_unmap_sg(mapping->gxp, mapping->vd, mapping->virt_core_list,
-			 mapping->sgt.sgl, mapping->sgt.orig_nents,
-			 mapping->dir, DMA_ATTR_SKIP_CPU_SYNC);
+	gxp_dma_unmap_sg(mapping->gxp, mapping->domain, mapping->sgt.sgl,
+			 mapping->sgt.orig_nents, mapping->dir,
+			 DMA_ATTR_SKIP_CPU_SYNC);
 
 	/* Unpin the user pages */
 	for_each_sg_page(mapping->sgt.sgl, &sg_iter, mapping->sgt.orig_nents,
@@ -57,9 +56,8 @@ static void destroy_mapping(struct gxp_mapping *mapping)
 }
 
 struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
-				       struct gxp_virtual_device *vd,
-				       uint virt_core_list, u64 user_address,
-				       size_t size, u32 flags,
+				       struct gxp_iommu_domain *domain,
+				       u64 user_address, size_t size, u32 flags,
 				       enum dma_data_direction dir)
 {
 	struct gxp_mapping *mapping = NULL;
@@ -154,8 +152,7 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
 	mapping->destructor = destroy_mapping;
 	mapping->host_address = user_address;
 	mapping->gxp = gxp;
-	mapping->virt_core_list = virt_core_list;
-	mapping->vd = vd;
+	mapping->domain = domain;
 	mapping->size = size;
 	mapping->gxp_dma_flags = flags;
 	mapping->dir = dir;
@@ -168,8 +165,8 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
 	}
 
 	/* map the user pages */
-	ret = gxp_dma_map_sg(gxp, mapping->vd, mapping->virt_core_list,
-			     mapping->sgt.sgl, mapping->sgt.nents, mapping->dir,
+	ret = gxp_dma_map_sg(gxp, mapping->domain, mapping->sgt.sgl,
+			     mapping->sgt.nents, mapping->dir,
 			     DMA_ATTR_SKIP_CPU_SYNC, mapping->gxp_dma_flags);
 	if (!ret) {
 		dev_err(gxp->dev, "Failed to map sgt (ret=%d)\n", ret);

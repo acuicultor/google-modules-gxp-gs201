@@ -8,13 +8,24 @@
 #define __GXP_FIRMWARE_H__
 
 #include <linux/bitops.h>
+#include <linux/sizes.h>
 
+#include "gxp-config.h"
 #include "gxp-internal.h"
 
 #if !IS_ENABLED(CONFIG_GXP_TEST)
 
+#ifdef CHIP_AURORA_SCRATCHPAD_OFF
+
+#define AURORA_SCRATCHPAD_OFF CHIP_AURORA_SCRATCHPAD_OFF
+#define AURORA_SCRATCHPAD_LEN CHIP_AURORA_SCRATCHPAD_LEN
+
+#else /* CHIP_AURORA_SCRATCHPAD_OFF */
+
 #define AURORA_SCRATCHPAD_OFF 0x000FF000 /* Last 4KB of ELF load region */
 #define AURORA_SCRATCHPAD_LEN 0x00001000 /* 4KB */
+
+#endif /* CHIP_AURORA_SCRATCHPAD_OFF */
 
 #else /* CONFIG_GXP_TEST */
 /* Firmware memory is shrunk in unit tests. */
@@ -27,6 +38,31 @@
 
 #define SCRATCHPAD_MSG_OFFSET(_msg_) (_msg_  <<  2)
 
+#define PRIVATE_FW_DATA_SIZE SZ_2M
+#define SHARED_FW_DATA_SIZE SZ_1M
+
+struct gxp_firmware_manager {
+	const struct firmware *firmwares[GXP_NUM_CORES];
+	char *firmware_name;
+	bool is_firmware_requested;
+	/* Protects `firmwares` and `firmware_name` */
+	struct mutex dsp_firmware_lock;
+	/* Firmware status bitmap. Accessors must hold `vd_semaphore`. */
+	u32 firmware_running;
+	/*
+	 * The boundary of readonly segments and writable segments.
+	 * The mappings are programmed as
+	 *   [fwbufs[i].daddr, rw_boundaries[i]): RO
+	 *   [rw_boundaries[i], daddr + fwbufs[i].size): RW
+	 *
+	 * The boundary information is collected by parsing the ELF
+	 * header after @firmwares have been fetched.
+	 */
+	dma_addr_t rw_boundaries[GXP_NUM_CORES];
+	/* Store the entry point of the DSP core firmware. */
+	u32 entry_points[GXP_NUM_CORES];
+};
+
 enum aurora_msg {
 	MSG_CORE_ALIVE,
 	MSG_TOP_ACCESS_OK,
@@ -37,7 +73,7 @@ enum aurora_msg {
 /* The caller must have locked gxp->vd_semaphore for reading. */
 static inline bool gxp_is_fw_running(struct gxp_dev *gxp, uint core)
 {
-	return (gxp->firmware_running & BIT(core)) != 0;
+	return (gxp->firmware_mgr->firmware_running & BIT(core)) != 0;
 }
 
 /*

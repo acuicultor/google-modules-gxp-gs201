@@ -25,12 +25,10 @@ int gxp_wakelock_init(struct gxp_dev *gxp)
 	return 0;
 }
 
-int gxp_wakelock_acquire(struct gxp_dev *gxp)
+static int gxp_wakelock_acquire_locked(struct gxp_dev *gxp)
 {
 	struct gxp_wakelock_manager *mgr = gxp->wakelock_mgr;
 	int ret = 0;
-
-	mutex_lock(&mgr->lock);
 
 	if (mgr->suspended) {
 		/*
@@ -51,16 +49,45 @@ int gxp_wakelock_acquire(struct gxp_dev *gxp)
 				ret, mgr->count);
 			goto err_blk_on;
 		}
+		if (gxp->wakelock_after_blk_on) {
+			ret = gxp->wakelock_after_blk_on(gxp);
+			if (ret) {
+				gxp_pm_blk_off(gxp);
+				goto err_blk_on;
+			}
+		}
 	}
 
 out:
-	mutex_unlock(&mgr->lock);
-
 	return ret;
 
 err_blk_on:
 	mgr->count--;
+	return ret;
+}
+
+int gxp_wakelock_acquire(struct gxp_dev *gxp)
+{
+	struct gxp_wakelock_manager *mgr = gxp->wakelock_mgr;
+	int ret;
+
+	mutex_lock(&mgr->lock);
+	ret = gxp_wakelock_acquire_locked(gxp);
 	mutex_unlock(&mgr->lock);
+
+	return ret;
+}
+
+int gxp_wakelock_acquire_if_powered(struct gxp_dev *gxp)
+{
+	struct gxp_wakelock_manager *mgr = gxp->wakelock_mgr;
+	int ret = -EAGAIN;
+
+	mutex_lock(&mgr->lock);
+	if (mgr->count)
+		ret = gxp_wakelock_acquire_locked(gxp);
+	mutex_unlock(&mgr->lock);
+
 	return ret;
 }
 
@@ -78,6 +105,8 @@ void gxp_wakelock_release(struct gxp_dev *gxp)
 	}
 
 	if (!--mgr->count) {
+		if (gxp->wakelock_before_blk_off)
+			gxp->wakelock_before_blk_off(gxp);
 		ret = gxp_pm_blk_off(gxp);
 		if (ret)
 			dev_err(gxp->dev,

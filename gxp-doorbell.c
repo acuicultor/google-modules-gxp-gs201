@@ -19,9 +19,9 @@ void gxp_doorbell_enable_for_core(struct gxp_dev *gxp, u32 doorbell_num,
 	u32 val;
 
 	/* Enable DOORBELL_NUM on requested core */
-	val = gxp_read_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0);
+	val = gxp_read_32(gxp, GXP_CORE_REG_COMMON_INT_MASK_0(core));
 	val |= BIT(doorbell_num);
-	gxp_write_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0, val);
+	gxp_write_32(gxp, GXP_CORE_REG_COMMON_INT_MASK_0(core), val);
 }
 
 void gxp_doorbell_set(struct gxp_dev *gxp, u32 doorbell_num)

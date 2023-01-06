@@ -11,18 +11,7 @@
 
 #include "gxp-internal.h"
 
-#define AUR_DVFS_MIN_RATE 178000
-static const uint aur_power_state2rate[] = {
-	0,		/* AUR_OFF */
-	178000,		/* AUR_UUD */
-	373000,		/* AUR_SUD */
-	750000,		/* AUR_UD */
-	1160000,	/* AUR_NOM */
-	178000,		/* AUR_READY */
-	268000,		/* AUR_UUD_PLUS */
-	560000,		/* AUR_SUD_PLUS */
-	975000,		/* AUR_UD_PLUS */
-};
+#define AUR_DVFS_MIN_RATE AUR_UUD_RATE
 
 enum aur_power_state {
 	AUR_OFF = 0,
@@ -34,6 +23,18 @@ enum aur_power_state {
 	AUR_UUD_PLUS = 6,
 	AUR_SUD_PLUS = 7,
 	AUR_UD_PLUS = 8,
+};
+
+static const uint aur_power_state2rate[] = {
+	AUR_OFF_RATE,
+	AUR_UUD_RATE,
+	AUR_SUD_RATE,
+	AUR_UD_RATE,
+	AUR_NOM_RATE,
+	AUR_READY_RATE,
+	AUR_UUD_PLUS_RATE,
+	AUR_SUD_PLUS_RATE,
+	AUR_UD_PLUS_RATE,
 };
 
 enum aur_memory_power_state {
@@ -91,6 +92,17 @@ struct gxp_req_pm_qos_work {
 	bool using;
 };
 
+struct gxp_power_states {
+	enum aur_power_state power;
+	enum aur_memory_power_state memory;
+	bool low_clkmux;
+};
+
+static const struct gxp_power_states off_states = { AUR_OFF, AUR_MEM_UNDEFINED,
+						    false };
+static const struct gxp_power_states uud_states = { AUR_UUD, AUR_MEM_UNDEFINED,
+						    false };
+
 struct gxp_power_manager {
 	struct gxp_dev *gxp;
 	struct mutex pm_lock;
@@ -107,7 +119,7 @@ struct gxp_power_manager {
 	/* Last requested clock mux state */
 	bool last_scheduled_low_clkmux;
 	int curr_state;
-	int curr_memory_state;
+	int curr_memory_state; /* Note: this state will not be maintained in the MCU mode. */
 	struct gxp_pm_device_ops *ops;
 	struct gxp_set_acpm_state_work
 		set_acpm_state_work[AUR_NUM_POWER_STATE_WORKER];
@@ -126,15 +138,20 @@ struct gxp_power_manager {
 	/* Max frequency that the thermal driver/ACPM will allow in Hz */
 	unsigned long thermal_limit;
 	u64 blk_switch_count;
+	/* PMU AUR_STATUS base address for block status, maybe NULL */
+	void __iomem *aur_status;
 };
 
 /**
  * gxp_pm_blk_on() - Turn on the power for BLK_AUR
  * @gxp: The GXP device to turn on
  *
+ * Note: For most cases you should use gxp_acquire_wakelock() to ensure the
+ * device is ready to use, unless you really want to power on the block without
+ * setting up the device state.
+ *
  * Return:
  * * 0       - BLK ON successfully
- * * -ENODEV - Cannot find PM interface
  */
 int gxp_pm_blk_on(struct gxp_dev *gxp);
 
@@ -144,10 +161,17 @@ int gxp_pm_blk_on(struct gxp_dev *gxp);
  *
  * Return:
  * * 0       - BLK OFF successfully
- * * -ENODEV - Cannot find PM interface
- * * -EBUSY  - Wakelock is held, blk is still busy
  */
 int gxp_pm_blk_off(struct gxp_dev *gxp);
+
+/**
+ * gxp_pm_is_blk_down() - Check weather the blk is turned off or not.
+ * @gxp: The GXP device to check
+ *
+ * Return:
+ * * true       - blk is turned off.
+ */
+bool gxp_pm_is_blk_down(struct gxp_dev *gxp);
 
 /**
  * gxp_pm_get_blk_state() - Get the blk power state
@@ -183,11 +207,8 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose);
  * gxp_pm_core_off() - Turn off a core on GXP device
  * @gxp: The GXP device to operate
  * @core: The core ID to turn off
- *
- * Return:
- * * 0       - Core off process finished successfully
  */
-int gxp_pm_core_off(struct gxp_dev *gxp, uint core);
+void gxp_pm_core_off(struct gxp_dev *gxp, uint core);
 
 /**
  * gxp_pm_init() - API for initialize PM interface for GXP, should only be
@@ -239,28 +260,36 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
  * gxp_pm_update_requested_power_states() - API for a GXP client to vote for a
  * requested power state and a requested memory power state.
  * @gxp: The GXP device to operate.
- * @origin_state: An existing old requested state, will be cleared. If this is
- *                the first vote, pass AUR_OFF.
- * @origin_requested_low_clkmux: Specify whether the existing vote was requested with
- *                               low frequency CLKMUX flag.
- * @requested_state: The new requested state.
- * @requested_low_clkmux: Specify whether the new vote is requested with low frequency
- *			  CLKMUX flag. Will take no effect if the @requested state is
- *			  AUR_OFF.
- * @origin_mem_state: An existing old requested state, will be cleared. If this is
- *                the first vote, pass AUR_MEM_UNDEFINED.
- * @requested_mem_state: The new requested state.
+ * @origin_states: An existing old requested states, will be cleared. If this is
+ *                the first vote, pass AUR_OFF and AUR_MEM_UNDEFINED for field
+ *                power_state and memory_state. The low_clkmux field will take no
+ *                effect if requested state is AUR_OFF.
+ * @requested_states: The new requested states.
  *
  * Return:
  * * 0       - Voting registered
  * * -EINVAL - Invalid original state or requested state
  */
 
-int gxp_pm_update_requested_power_states(
-	struct gxp_dev *gxp, enum aur_power_state origin_state,
-	bool origin_requested_low_clkmux, enum aur_power_state requested_state,
-	bool requested_low_clkmux, enum aur_memory_power_state origin_mem_state,
-	enum aur_memory_power_state requested_mem_state);
+int gxp_pm_update_requested_power_states(struct gxp_dev *gxp,
+					 struct gxp_power_states origin_states,
+					 struct gxp_power_states requested_states);
+
+/**
+ * gxp_pm_update_pm_qos() - API for updating the memory power state but passing the values of
+ * INT and MIF frequencies directly. This function will ignore the vote ratings and update the
+ * frequencies right away.
+ * @gxp: The GXP device to operate.
+ * @int_val: The value of INT frequency.
+ * @mif_val: The value of MIF frequency.
+ *
+ * Note: This function will not update the @curr_memory_state of gxp_power_manager.
+ *
+ * Return:
+ * * 0       - The memory power state has been changed
+ * * -EINVAL - Invalid requested state
+ */
+int gxp_pm_update_pm_qos(struct gxp_dev *gxp, s32 int_val, s32 mif_val);
 
 /*
  * gxp_pm_force_clkmux_normal() - Force PLL_CON0_NOC_USER and PLL_CON0_PLL_AUR MUX

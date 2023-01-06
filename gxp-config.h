@@ -18,11 +18,6 @@
 
 #endif /* unknown */
 
-#if IS_ENABLED(CONFIG_GXP_GEM5)
-#undef GXP_NUM_CORES
-#define GXP_NUM_CORES 1
-#endif
-
 #define GXP_NUM_PREALLOCATED_DOMAINS GXP_NUM_CORES
 
 #if defined(CONFIG_GXP_ZEBU) || defined(CONFIG_GXP_IP_ZEBU)
@@ -35,13 +30,16 @@
 
 #define SYNC_BARRIER_COUNT 16
 
-/* Core address space starts at Inst_BPM block */
-#define GXP_CORE_0_BASE GXP_REG_CORE_0_INST_BPM
-#define GXP_CORE_SIZE (GXP_REG_CORE_1_INST_BPM - GXP_REG_CORE_0_INST_BPM)
+#ifndef GXP_USE_LEGACY_MAILBOX
+#define GXP_USE_LEGACY_MAILBOX 0
+#endif
 
-/* LPM address space starts at lpm_version register */
-#define GXP_LPM_BASE GXP_REG_LPM_VERSION
-#define GXP_LPM_PSM_0_BASE GXP_REG_LPM_PSM_0
-#define GXP_LPM_PSM_SIZE (GXP_REG_LPM_PSM_1 - GXP_REG_LPM_PSM_0)
+#ifndef GXP_HAS_LAP
+#define GXP_HAS_LAP 1
+#endif
+
+#ifndef GXP_HAS_MCU
+#define GXP_HAS_MCU 1
+#endif
 
 #endif /* __GXP_CONFIG_H__ */

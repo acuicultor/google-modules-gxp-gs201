@@ -8,8 +8,10 @@
 #include <linux/acpm_dvfs.h>
 
 #include "gxp-client.h"
+#include "gxp-core-telemetry.h"
 #include "gxp-debug-dump.h"
 #include "gxp-debugfs.h"
+#include "gxp-dma.h"
 #include "gxp-firmware-data.h"
 #include "gxp-firmware.h"
 #include "gxp-internal.h"
@@ -17,14 +19,17 @@
 #include "gxp-lpm.h"
 #include "gxp-mailbox.h"
 #include "gxp-pm.h"
-#include "gxp-telemetry.h"
 #include "gxp-vd.h"
 #include "gxp-wakelock.h"
 #include "gxp.h"
 
+#if GXP_HAS_MCU
+#include "gxp-mcu-platform.h"
+#endif
+
 static int gxp_debugfs_lpm_test(void *data, u64 val)
 {
-	struct gxp_dev *gxp = (struct gxp_dev *) data;
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
 
 	dev_info(gxp->dev, "%llu\n", val);
 
@@ -35,49 +40,87 @@ DEFINE_DEBUGFS_ATTRIBUTE(gxp_lpm_test_fops, NULL, gxp_debugfs_lpm_test,
 
 static int gxp_debugfs_mailbox(void *data, u64 val)
 {
-	int core;
-	struct gxp_command cmd;
-	struct gxp_response resp;
+	int core = 0, retval;
+	u16 status;
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	struct gxp_mailbox *mbx;
+	struct gxp_power_states power_states = {
+		.power = GXP_POWER_STATE_NOM,
+		.memory = MEMORY_POWER_STATE_UNDEFINED,
+	};
+	u16 cmd_code;
+	int ret;
 
-	core = val / 1000;
-	if (core >= GXP_NUM_CORES) {
-		dev_notice(gxp->dev,
-			   "Mailbox for core %d doesn't exist.\n", core);
-		return -EINVAL;
+	mutex_lock(&gxp->debugfs_client_lock);
+
+#if GXP_HAS_MCU
+	if (gxp_is_direct_mode(gxp)) {
+#endif
+		core = val / 1000;
+		if (core >= GXP_NUM_CORES) {
+			dev_notice(gxp->dev,
+				   "Mailbox for core %d doesn't exist.\n",
+				   core);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (gxp->mailbox_mgr->mailboxes[core] == NULL) {
+			dev_notice(
+				gxp->dev,
+				"Unable to send mailbox command -- mailbox %d not ready\n",
+				core);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		mbx = gxp->mailbox_mgr->mailboxes[core];
+		cmd_code = GXP_MBOX_CODE_DISPATCH;
+#if GXP_HAS_MCU
+	} else {
+		if (!gxp->debugfs_client) {
+			dev_err(gxp->dev,
+				"You should load firmwares via gxp/firmware_run first\n");
+			ret = -EIO;
+			goto out;
+		}
+
+		mbx = to_mcu_dev(gxp)->mcu.uci.mbx;
+		if (!mbx) {
+			dev_err(gxp->dev, "UCI is not initialized.\n");
+			ret = -EIO;
+			goto out;
+		}
+
+		cmd_code = CORE_COMMAND;
 	}
-
-	if (gxp->mailbox_mgr == NULL ||
-	    gxp->mailbox_mgr->mailboxes[core] == NULL) {
-		dev_notice(gxp->dev,
-			   "Unable to send mailbox command -- mailbox %d not ready\n",
-			   core);
-		return -EINVAL;
-	}
-
-	cmd.code = (u16) val;
-	cmd.priority = 0;
-	cmd.buffer_descriptor.address = 0;
-	cmd.buffer_descriptor.size = 0;
-	cmd.buffer_descriptor.flags = 0;
+#endif
 
 	down_read(&gxp->vd_semaphore);
-	gxp_mailbox_execute_cmd(gxp->mailbox_mgr->mailboxes[core], &cmd, &resp);
+	/* In direct mode, gxp->debugfs_client and core will be ignored. */
+	retval = gxp->mailbox_mgr->execute_cmd(gxp->debugfs_client, mbx, core,
+					       cmd_code, 0, 0, 0, 0, 1,
+					       power_states, NULL, &status);
 	up_read(&gxp->vd_semaphore);
 
-	dev_info(gxp->dev,
-		"Mailbox Command Sent: cmd.code=%d, resp.status=%d, resp.retval=%d\n",
-		cmd.code, resp.status, resp.retval);
-	return 0;
+	dev_info(
+		gxp->dev,
+		"Mailbox Command Sent: core=%d, resp.status=%d, resp.retval=%d\n",
+		core, status, retval);
+	ret = 0;
+out:
+	mutex_unlock(&gxp->debugfs_client_lock);
+	return ret;
 }
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_mailbox_fops, NULL, gxp_debugfs_mailbox, "%llu\n");
 
 static int gxp_firmware_run_set(void *data, u64 val)
 {
-	struct gxp_dev *gxp = (struct gxp_dev *) data;
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	struct gxp_client *client;
 	int ret = 0;
 	uint core;
+	bool acquired_block_wakelock;
 
 	ret = gxp_firmware_request_if_needed(gxp);
 	if (ret) {
@@ -89,7 +132,7 @@ static int gxp_firmware_run_set(void *data, u64 val)
 
 	if (val) {
 		if (gxp->debugfs_client) {
-			dev_err(gxp->dev, "Firmware already running!\n");
+			dev_err(gxp->dev, "Firmware is already running!\n");
 			ret = -EIO;
 			goto out;
 		}
@@ -109,6 +152,7 @@ static int gxp_firmware_run_set(void *data, u64 val)
 				goto out;
 			}
 		}
+		up_write(&gxp->vd_semaphore);
 
 		/*
 		 * Cleanup any bad state or corruption the device might've
@@ -124,34 +168,31 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		}
 		gxp->debugfs_client = client;
 
-		gxp->debugfs_client->vd = gxp_vd_allocate(gxp, GXP_NUM_CORES);
-		if (IS_ERR(gxp->debugfs_client->vd)) {
+		down_write(&client->semaphore);
+
+		ret = gxp_client_allocate_virtual_device(client, GXP_NUM_CORES, 0);
+		if (ret) {
 			dev_err(gxp->dev, "Failed to allocate VD\n");
-			ret = PTR_ERR(gxp->debugfs_client->vd);
-			goto err_wakelock;
+			goto err_destroy_client;
 		}
 
-		ret = gxp_wakelock_acquire(gxp);
+		ret = gxp_client_acquire_block_wakelock(
+			client, &acquired_block_wakelock);
 		if (ret) {
 			dev_err(gxp->dev, "Failed to acquire BLOCK wakelock\n");
-			goto err_wakelock;
+			goto err_destroy_client;
 		}
-		gxp->debugfs_client->has_block_wakelock = true;
-		gxp_pm_update_requested_power_states(gxp, AUR_OFF, true,
-						     AUR_UUD, true,
-						     AUR_MEM_UNDEFINED,
-						     AUR_MEM_UNDEFINED);
 
-		ret = gxp_vd_start(gxp->debugfs_client->vd);
-		up_write(&gxp->vd_semaphore);
+		ret = gxp_client_acquire_vd_wakelock(client, uud_states);
 		if (ret) {
-			dev_err(gxp->dev, "Failed to start VD\n");
-			goto err_start;
+			dev_err(gxp->dev, "Failed to acquire VD wakelock\n");
+			goto err_release_block_wakelock;
 		}
-		gxp->debugfs_client->has_vd_wakelock = true;
+
+		up_write(&client->semaphore);
 	} else {
 		if (!gxp->debugfs_client) {
-			dev_err(gxp->dev, "Firmware not running!\n");
+			dev_err(gxp->dev, "Firmware is not running!\n");
 			ret = -EIO;
 			goto out;
 		}
@@ -162,10 +203,6 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		 */
 		gxp_client_destroy(gxp->debugfs_client);
 		gxp->debugfs_client = NULL;
-		gxp_pm_update_requested_power_states(gxp, AUR_UUD, true,
-						     AUR_OFF, true,
-						     AUR_MEM_UNDEFINED,
-						     AUR_MEM_UNDEFINED);
 	}
 
 out:
@@ -173,14 +210,12 @@ out:
 
 	return ret;
 
-err_start:
-	gxp_wakelock_release(gxp);
-	gxp_pm_update_requested_power_states(gxp, AUR_UUD, true, AUR_OFF, true,
-					     AUR_MEM_UNDEFINED,
-					     AUR_MEM_UNDEFINED);
-err_wakelock:
+err_release_block_wakelock:
+	gxp_client_release_block_wakelock(client);
+err_destroy_client:
+	up_write(&client->semaphore);
 	/* Destroying a client cleans up any VDss or wakelocks it held. */
-	gxp_client_destroy(gxp->debugfs_client);
+	gxp_client_destroy(client);
 	gxp->debugfs_client = NULL;
 	mutex_unlock(&gxp->debugfs_client_lock);
 	return ret;
@@ -188,10 +223,10 @@ err_wakelock:
 
 static int gxp_firmware_run_get(void *data, u64 *val)
 {
-	struct gxp_dev *gxp = (struct gxp_dev *) data;
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
 
 	down_read(&gxp->vd_semaphore);
-	*val = gxp->firmware_running;
+	*val = gxp->firmware_mgr->firmware_running;
 	up_read(&gxp->vd_semaphore);
 
 	return 0;
@@ -224,10 +259,8 @@ static int gxp_wakelock_set(void *data, u64 val)
 			goto out;
 		}
 		gxp->debugfs_wakelock_held = true;
-		gxp_pm_update_requested_power_states(gxp, AUR_OFF, true,
-						     AUR_UUD, true,
-						     AUR_MEM_UNDEFINED,
-						     AUR_MEM_UNDEFINED);
+		gxp_pm_update_requested_power_states(gxp, off_states,
+						     uud_states);
 	} else {
 		/* Wakelock Release */
 		if (!gxp->debugfs_wakelock_held) {
@@ -238,10 +271,8 @@ static int gxp_wakelock_set(void *data, u64 val)
 
 		gxp_wakelock_release(gxp);
 		gxp->debugfs_wakelock_held = false;
-		gxp_pm_update_requested_power_states(gxp, AUR_UUD, true,
-						     AUR_OFF, true,
-						     AUR_MEM_UNDEFINED,
-						     AUR_MEM_UNDEFINED);
+		gxp_pm_update_requested_power_states(gxp, uud_states,
+						     off_states);
 	}
 
 out:
@@ -321,29 +352,24 @@ static int gxp_log_buff_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	int i;
-	u64 **buffers;
+	struct gxp_coherent_buf *buffers;
 	u64 *ptr;
 
-	mutex_lock(&gxp->telemetry_mgr->lock);
+	mutex_lock(&gxp->core_telemetry_mgr->lock);
 
-	if (!gxp->telemetry_mgr->logging_buff_data) {
-		dev_err(gxp->dev, "%s: Logging buffer has not been created\n",
-			__func__);
-		mutex_unlock(&gxp->telemetry_mgr->lock);
+	if (!gxp->core_telemetry_mgr->logging_buff_data_legacy) {
+		dev_err(gxp->dev, "Logging buffer has not been created");
+		mutex_unlock(&gxp->core_telemetry_mgr->lock);
 		return -ENODEV;
 	}
 
-	buffers = (u64 **)gxp->telemetry_mgr->logging_buff_data->buffers;
+	buffers = gxp->core_telemetry_mgr->logging_buff_data_legacy->buffers;
 	for (i = 0; i < GXP_NUM_CORES; i++) {
-		ptr = buffers[i];
+		ptr = buffers[i].vaddr;
 		*ptr = val;
 	}
-	dev_dbg(gxp->dev,
-		"%s: log buff first bytes: [0] = %llu, [1] = %llu, [2] = %llu, [3] = %llu (val=%llu)\n",
-		__func__, *buffers[0], *buffers[1], *buffers[2], *buffers[3],
-		val);
 
-	mutex_unlock(&gxp->telemetry_mgr->lock);
+	mutex_unlock(&gxp->core_telemetry_mgr->lock);
 
 	return 0;
 }
@@ -351,25 +377,21 @@ static int gxp_log_buff_set(void *data, u64 val)
 static int gxp_log_buff_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
-	u64 **buffers;
+	struct gxp_coherent_buf *buffers;
 
-	mutex_lock(&gxp->telemetry_mgr->lock);
+	mutex_lock(&gxp->core_telemetry_mgr->lock);
 
-	if (!gxp->telemetry_mgr->logging_buff_data) {
-		dev_err(gxp->dev, "%s: Logging buffer has not been created\n",
-			__func__);
-		mutex_unlock(&gxp->telemetry_mgr->lock);
+	if (!gxp->core_telemetry_mgr->logging_buff_data_legacy) {
+		dev_err(gxp->dev, "Logging buffer has not been created");
+		mutex_unlock(&gxp->core_telemetry_mgr->lock);
 		return -ENODEV;
 	}
 
-	buffers = (u64 **)gxp->telemetry_mgr->logging_buff_data->buffers;
-	dev_dbg(gxp->dev,
-		"%s: log buff first bytes: [0] = %llu, [1] = %llu, [2] = %llu, [3] = %llu\n",
-		__func__, *buffers[0], *buffers[1], *buffers[2], *buffers[3]);
+	buffers = gxp->core_telemetry_mgr->logging_buff_data_legacy->buffers;
 
-	*val = *buffers[0];
+	*val = *(u64 *)(buffers[0].vaddr);
 
-	mutex_unlock(&gxp->telemetry_mgr->lock);
+	mutex_unlock(&gxp->core_telemetry_mgr->lock);
 
 	return 0;
 }
@@ -382,17 +404,17 @@ static int gxp_log_eventfd_signal_set(void *data, u64 val)
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	int ret = 0;
 
-	mutex_lock(&gxp->telemetry_mgr->lock);
+	mutex_lock(&gxp->core_telemetry_mgr->lock);
 
-	if (!gxp->telemetry_mgr->logging_efd) {
+	if (!gxp->core_telemetry_mgr->logging_efd) {
 		ret = -ENODEV;
 		goto out;
 	}
 
-	ret = eventfd_signal(gxp->telemetry_mgr->logging_efd, 1);
+	ret = eventfd_signal(gxp->core_telemetry_mgr->logging_efd, 1);
 
 out:
-	mutex_unlock(&gxp->telemetry_mgr->lock);
+	mutex_unlock(&gxp->core_telemetry_mgr->lock);
 
 	return ret;
 }
@@ -400,37 +422,33 @@ out:
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_log_eventfd_signal_fops, NULL,
 			 gxp_log_eventfd_signal_set, "%llu\n");
 
-/* TODO: Remove these mux entry once experiment is done */
 static int gxp_cmu_mux1_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
-	void *addr;
 
+	if (IS_ERR_OR_NULL(gxp->cmu.vaddr)) {
+		dev_err(gxp->dev, "CMU registers are not mapped");
+		return -ENODEV;
+	}
 	if (val > 1) {
-		dev_err(gxp->dev, "Incorrect val for cmu_mux1, only 0 and 1 allowed\n");
+		dev_err(gxp->dev,
+			"Incorrect val for cmu_mux1, only 0 and 1 allowed\n");
 		return -EINVAL;
 	}
 
-	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
-
-	if (!addr) {
-		dev_err(gxp->dev, "Cannot map CMU1 address\n");
-		return -EIO;
-	}
-
-	writel(val << 4, addr + PLL_CON0_PLL_AUR);
-	iounmap(addr);
+	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
 	return 0;
 }
 
 static int gxp_cmu_mux1_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
-	void *addr;
 
-	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
-	*val = readl(addr + PLL_CON0_PLL_AUR);
-	iounmap(addr);
+	if (IS_ERR_OR_NULL(gxp->cmu.vaddr)) {
+		dev_err(gxp->dev, "CMU registers are not mapped");
+		return -ENODEV;
+	}
+	*val = readl(gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
 	return 0;
 }
 
@@ -440,33 +458,30 @@ DEFINE_DEBUGFS_ATTRIBUTE(gxp_cmu_mux1_fops, gxp_cmu_mux1_get, gxp_cmu_mux1_set,
 static int gxp_cmu_mux2_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
-	void *addr;
 
+	if (IS_ERR_OR_NULL(gxp->cmu.vaddr)) {
+		dev_err(gxp->dev, "CMU registers are not mapped");
+		return -ENODEV;
+	}
 	if (val > 1) {
-		dev_err(gxp->dev, "Incorrect val for cmu_mux2, only 0 and 1 allowed\n");
+		dev_err(gxp->dev,
+			"Incorrect val for cmu_mux2, only 0 and 1 allowed\n");
 		return -EINVAL;
 	}
 
-	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
-
-	if (!addr) {
-		dev_err(gxp->dev, "Cannot map CMU2 address\n");
-		return -EIO;
-	}
-
-	writel(val << 4, addr + PLL_CON0_NOC_USER);
-	iounmap(addr);
+	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
 	return 0;
 }
 
 static int gxp_cmu_mux2_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
-	void *addr;
 
-	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
-	*val = readl(addr + 0x610);
-	iounmap(addr);
+	if (IS_ERR_OR_NULL(gxp->cmu.vaddr)) {
+		dev_err(gxp->dev, "CMU registers are not mapped");
+		return -ENODEV;
+	}
+	*val = readl(gxp->cmu.vaddr + PLL_CON0_NOC_USER);
 	return 0;
 }
 
@@ -505,6 +520,8 @@ void gxp_create_debugfs(struct gxp_dev *gxp)
 
 void gxp_remove_debugfs(struct gxp_dev *gxp)
 {
+	if (IS_GXP_TEST && !gxp->d_entry)
+		return;
 	debugfs_remove_recursive(gxp->d_entry);
 
 	/*

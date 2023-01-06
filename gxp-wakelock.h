@@ -18,7 +18,7 @@ struct gxp_wakelock_manager {
 };
 
 /**
- * gxp_telemetry_init() - Initialize wakelock support
+ * gxp_wakelock_init() - Initialize wakelock support
  * @gxp: The GXP device to initialize wakelock support for
  *
  * Return:
@@ -40,6 +40,21 @@ int gxp_wakelock_init(struct gxp_dev *gxp);
  * * Other   - An attempt to power on BLK_AUR failed
  */
 int gxp_wakelock_acquire(struct gxp_dev *gxp);
+
+/**
+ * gxp_wakelock_acquire_if_powered() - Increment the GXP wakelock counter if
+ *                                     the counter is nonzero.
+ * @gxp: The GXP device to increment the wakelock counter for
+ *
+ * Similar to gxp_wakelock_acquire, but only increment the wakelock counter if
+ * the counter is nonzero.
+ *
+ * Return:
+ * * 0       - Success
+ * * -EAGAIN - Wakelock counter is zero
+ * * Other   - Error returned by gxp_wakelock_acquire
+ */
+int gxp_wakelock_acquire_if_powered(struct gxp_dev *gxp);
 
 /**
  * gxp_wakelock_release() - Decrement the GXP wakelock counter

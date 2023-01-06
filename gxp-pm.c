@@ -6,6 +6,7 @@
  */
 
 #include <linux/acpm_dvfs.h>
+#include <linux/bits.h>
 #include <linux/io.h>
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
@@ -14,10 +15,16 @@
 
 #include "gxp-bpm.h"
 #include "gxp-client.h"
+#include "gxp-config.h"
+#include "gxp-dma.h"
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
 #include "gxp-pm.h"
+
+#define SHUTDOWN_DELAY_US_MIN 200
+#define SHUTDOWN_DELAY_US_MAX 400
+#define SHUTDOWN_MAX_DELAY_COUNT 20
 
 /*
  * The order of this array decides the voting priority, should be increasing in
@@ -32,17 +39,20 @@ static const uint aur_memory_state_array[] = {
 	AUR_MEM_HIGH,	   AUR_MEM_VERY_HIGH, AUR_MEM_MAX
 };
 
-/*
- * TODO(b/177692488): move frequency values into chip-specific config.
- * TODO(b/221168126): survey how these value are derived from. Below
- * values are copied from the implementation in TPU firmware for PRO,
- * i.e. google3/third_party/darwinn/firmware/janeiro/power_manager.cc.
- */
-static const s32 aur_memory_state2int_table[] = { 0,	  0,	  0,	 200000,
-						  332000, 465000, 533000 };
-static const s32 aur_memory_state2mif_table[] = { 0,	   0,	    0,
-						  1014000, 1352000, 2028000,
-						  3172000 };
+static const s32 aur_memory_state2int_table[] = { 0,
+						  AUR_MEM_INT_MIN,
+						  AUR_MEM_INT_VERY_LOW,
+						  AUR_MEM_INT_LOW,
+						  AUR_MEM_INT_HIGH,
+						  AUR_MEM_INT_VERY_HIGH,
+						  AUR_MEM_INT_MAX };
+static const s32 aur_memory_state2mif_table[] = { 0,
+						  AUR_MEM_MIF_MIN,
+						  AUR_MEM_MIF_VERY_LOW,
+						  AUR_MEM_MIF_LOW,
+						  AUR_MEM_MIF_HIGH,
+						  AUR_MEM_MIF_VERY_HIGH,
+						  AUR_MEM_MIF_MAX };
 
 static struct gxp_pm_device_ops gxp_aur_ops = {
 	.pre_blk_powerup = NULL,
@@ -62,8 +72,9 @@ static int gxp_pm_blkpwr_up(struct gxp_dev *gxp)
 	 */
 	ret = pm_runtime_resume_and_get(gxp->dev);
 	if (ret)
-		dev_err(gxp->dev, "%s: pm_runtime_resume_and_get returned %d\n",
-			__func__, ret);
+		dev_err(gxp->dev,
+			"pm_runtime_resume_and_get returned %d during blk up\n",
+			ret);
 	return ret;
 }
 
@@ -75,9 +86,7 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 	 * Need to put TOP LPM into active state before blk off
 	 * b/189396709
 	 */
-	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_1, 0x0);
-	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_2, 0x0);
-	if (!gxp_lpm_wait_state_eq(gxp, LPM_TOP_PSM, LPM_ACTIVE_STATE)) {
+	if (!gxp_lpm_wait_state_eq(gxp, LPM_PSM_TOP, LPM_ACTIVE_STATE)) {
 		dev_err(gxp->dev,
 			"failed to force TOP LPM to PS0 during blk down\n");
 		return -EAGAIN;
@@ -91,8 +100,9 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 		 * indicate the device is still in use somewhere. The only
 		 * expected value here is 0, indicating no remaining users.
 		 */
-		dev_err(gxp->dev, "%s: pm_runtime_put_sync returned %d\n",
-			__func__, ret);
+		dev_err(gxp->dev,
+			"pm_runtime_put_sync returned %d during blk down\n",
+			ret);
 	/* Remove our vote for INT/MIF state (if any) */
 	exynos_pm_qos_update_request(&gxp->power_mgr->int_min, 0);
 	exynos_pm_qos_update_request(&gxp->power_mgr->mif_min, 0);
@@ -117,7 +127,7 @@ int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate)
 {
 	int ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, rate);
 
-	dev_dbg(gxp->dev, "%s: rate %lu, ret %d\n", __func__, rate, ret);
+	dev_dbg(gxp->dev, "set blk rate %lu, ret %d\n", rate, ret);
 	return ret;
 }
 
@@ -199,35 +209,33 @@ out:
 	mutex_unlock(&set_acpm_state_work->gxp->power_mgr->pm_lock);
 }
 
+#define AUR_DVFS_DEBUG_REQ BIT(31)
+#define AUR_DEBUG_CORE_FREQ (AUR_DVFS_DEBUG_REQ | (3 << 27))
+
 int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp)
 {
 	int ret = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, AUR_DEBUG_CORE_FREQ);
 
-	dev_dbg(gxp->dev, "%s: state %d\n", __func__, ret);
+	dev_dbg(gxp->dev, "current blk state %d\n", ret);
 	return ret;
 }
 
 int gxp_pm_blk_on(struct gxp_dev *gxp)
 {
-	int ret = 0;
-
-	if (WARN_ON(!gxp->power_mgr)) {
-		dev_err(gxp->dev, "%s: No PM found\n", __func__);
-		return -ENODEV;
-	}
+	int ret;
 
 	dev_info(gxp->dev, "Powering on BLK ...\n");
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	ret = gxp_pm_blkpwr_up(gxp);
-	if (!ret) {
-		gxp_pm_blk_set_state_acpm(gxp, AUR_INIT_DVFS_STATE);
-		gxp->power_mgr->curr_state = AUR_INIT_DVFS_STATE;
-	}
-
+	if (ret)
+		goto out;
+	gxp_pm_blk_set_state_acpm(gxp, AUR_INIT_DVFS_STATE);
+	gxp->power_mgr->curr_state = AUR_INIT_DVFS_STATE;
+	gxp_iommu_setup_shareability(gxp);
 	/* Startup TOP's PSM */
 	gxp_lpm_init(gxp);
 	gxp->power_mgr->blk_switch_count++;
-
+out:
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 
 	return ret;
@@ -237,10 +245,6 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-	if (WARN_ON(!gxp->power_mgr)) {
-		dev_err(gxp->dev, "%s: No PM found\n", __func__);
-		return -ENODEV;
-	}
 	dev_info(gxp->dev, "Powering off BLK ...\n");
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	/*
@@ -264,14 +268,30 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 	return ret;
 }
 
+bool gxp_pm_is_blk_down(struct gxp_dev *gxp)
+{
+	int timeout_cnt = 0;
+	int curr_state;
+
+	if (!gxp->power_mgr->aur_status)
+		return gxp->power_mgr->curr_state == AUR_OFF;
+
+	do {
+		/* Delay 200~400us per retry till blk shutdown finished */
+		usleep_range(SHUTDOWN_DELAY_US_MIN, SHUTDOWN_DELAY_US_MAX);
+		curr_state = readl(gxp->power_mgr->aur_status);
+		if (!curr_state)
+			return true;
+		timeout_cnt++;
+	} while (timeout_cnt < SHUTDOWN_MAX_DELAY_COUNT);
+
+	return false;
+}
+
 int gxp_pm_get_blk_switch_count(struct gxp_dev *gxp)
 {
 	int ret;
 
-	if (!gxp->power_mgr) {
-		dev_err(gxp->dev, "%s: No PM found\n", __func__);
-		return -ENODEV;
-	}
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	ret = gxp->power_mgr->blk_switch_count;
 	mutex_unlock(&gxp->power_mgr->pm_lock);
@@ -283,10 +303,6 @@ int gxp_pm_get_blk_state(struct gxp_dev *gxp)
 {
 	int ret;
 
-	if (!gxp->power_mgr) {
-		dev_err(gxp->dev, "%s: No PM found\n", __func__);
-		return -ENODEV;
-	}
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	ret = gxp->power_mgr->curr_state;
 	mutex_unlock(&gxp->power_mgr->pm_lock);
@@ -296,17 +312,17 @@ int gxp_pm_get_blk_state(struct gxp_dev *gxp)
 
 int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose)
 {
-	int ret = 0;
+	int ret;
 
-	/*
-	 * Check if TOP LPM is already on.
-	 */
-	WARN_ON(!gxp_lpm_is_initialized(gxp, LPM_TOP_PSM));
+	if (!gxp_lpm_is_initialized(gxp, LPM_PSM_TOP)) {
+		dev_err(gxp->dev, "unable to power on core without TOP powered");
+		return -EINVAL;
+	}
 
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	ret = gxp_lpm_up(gxp, core);
 	if (ret) {
-		dev_err(gxp->dev, "%s: Core %d on fail\n", __func__, core);
+		dev_err(gxp->dev, "Core %d on fail\n", core);
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return ret;
 	}
@@ -314,22 +330,19 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose)
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 
 	if (verbose)
-		dev_notice(gxp->dev, "%s: Core %d up\n", __func__, core);
+		dev_notice(gxp->dev, "Core %d powered up\n", core);
 	return ret;
 }
 
-int gxp_pm_core_off(struct gxp_dev *gxp, uint core)
+void gxp_pm_core_off(struct gxp_dev *gxp, uint core)
 {
-	/*
-	 * Check if TOP LPM is already on.
-	 */
-	WARN_ON(!gxp_lpm_is_initialized(gxp, LPM_TOP_PSM));
+	if (!gxp_lpm_is_initialized(gxp, LPM_PSM_TOP))
+		return;
 
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	gxp_lpm_down(gxp, core);
 	mutex_unlock(&gxp->power_mgr->pm_lock);
-	dev_notice(gxp->dev, "%s: Core %d down\n", __func__, core);
-	return 0;
+	dev_notice(gxp->dev, "Core %d powered down\n", core);
 }
 
 static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
@@ -662,33 +675,39 @@ static int gxp_pm_update_requested_memory_power_state(
 }
 
 int gxp_pm_update_requested_power_states(
-	struct gxp_dev *gxp, enum aur_power_state origin_state,
-	bool origin_requested_low_clkmux, enum aur_power_state requested_state,
-	bool requested_low_clkmux, enum aur_memory_power_state origin_mem_state,
-	enum aur_memory_power_state requested_mem_state)
+	struct gxp_dev *gxp, struct gxp_power_states origin_vote,
+	struct gxp_power_states requested_states)
 {
 	int ret = 0;
 
 	mutex_lock(&gxp->power_mgr->pm_lock);
-	if (origin_state != requested_state ||
-	    origin_requested_low_clkmux != requested_low_clkmux) {
+	if (origin_vote.power != requested_states.power ||
+	    origin_vote.low_clkmux != requested_states.low_clkmux) {
 		ret = gxp_pm_update_requested_power_state(
-			gxp, origin_state, origin_requested_low_clkmux,
-			requested_state, requested_low_clkmux);
+			gxp, origin_vote.power, origin_vote.low_clkmux,
+			requested_states.power, requested_states.low_clkmux);
 		if (ret)
 			goto out;
 	}
-	if (origin_mem_state != requested_mem_state)
+	if (origin_vote.memory != requested_states.memory)
 		ret = gxp_pm_update_requested_memory_power_state(
-			gxp, origin_mem_state, requested_mem_state);
+			gxp, origin_vote.memory, requested_states.memory);
 out:
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 	return ret;
 }
 
+int gxp_pm_update_pm_qos(struct gxp_dev *gxp, s32 int_val, s32 mif_val)
+{
+	return gxp_pm_req_pm_qos(gxp, int_val, mif_val);
+}
+
 int gxp_pm_init(struct gxp_dev *gxp)
 {
 	struct gxp_power_manager *mgr;
+	struct platform_device *pdev =
+		container_of(gxp->dev, struct platform_device, dev);
+	struct resource *r;
 	uint i;
 
 	mgr = devm_kzalloc(gxp->dev, sizeof(*mgr), GFP_KERNEL);
@@ -719,6 +738,20 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	gxp->power_mgr->force_mux_normal_count = 0;
 	gxp->power_mgr->blk_switch_count = 0l;
 
+	r = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+					 "pmu_aur_status");
+	if (!r) {
+		dev_warn(gxp->dev, "Failed to find PMU register base\n");
+	} else {
+		gxp->power_mgr->aur_status = devm_ioremap_resource(gxp->dev, r);
+		if (IS_ERR(gxp->power_mgr->aur_status)) {
+			dev_err(gxp->dev,
+				"Failed to map PMU register base, ret=%ld\n",
+				PTR_ERR(gxp->power_mgr->aur_status));
+			gxp->power_mgr->aur_status = NULL;
+		}
+	}
+
 	pm_runtime_enable(gxp->dev);
 	exynos_pm_qos_add_request(&mgr->int_min, PM_QOS_DEVICE_THROUGHPUT, 0);
 	exynos_pm_qos_add_request(&mgr->mif_min, PM_QOS_BUS_THROUGHPUT, 0);
@@ -728,9 +761,11 @@ int gxp_pm_init(struct gxp_dev *gxp)
 
 int gxp_pm_destroy(struct gxp_dev *gxp)
 {
-	struct gxp_power_manager *mgr;
+	struct gxp_power_manager *mgr = gxp->power_mgr;
 
-	mgr = gxp->power_mgr;
+	if (IS_GXP_TEST && !mgr)
+		return 0;
+
 	exynos_pm_qos_remove_request(&mgr->mif_min);
 	exynos_pm_qos_remove_request(&mgr->int_min);
 	pm_runtime_disable(gxp->dev);
