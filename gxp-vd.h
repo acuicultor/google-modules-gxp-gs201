@@ -11,12 +11,16 @@
 #include <linux/iommu.h>
 #include <linux/list.h>
 #include <linux/rbtree.h>
+#include <linux/refcount.h>
 #include <linux/rwsem.h>
 #include <linux/scatterlist.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 
+#include <gcip/gcip-image-config.h>
+
+#include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
 #include "gxp-mapping.h"
 
@@ -48,6 +52,12 @@ enum gxp_virtual_device_state {
 	 * Note: this state will only be set on suspend/resume failure.
 	 */
 	GXP_VD_UNAVAILABLE,
+	/*
+	 * gxp_vd_release() has been called. VD with this state means it's
+	 * waiting for the last reference to be put(). All fields in VD is
+	 * invalid in this state.
+	 */
+	GXP_VD_RELEASED,
 };
 
 struct gxp_virtual_device {
@@ -58,6 +68,8 @@ struct gxp_virtual_device {
 	struct mailbox_resp_queue *mailbox_resp_queues;
 	struct rb_root mappings_root;
 	struct rw_semaphore mappings_semaphore;
+	/* Used to save doorbell state on VD resume. */
+	uint doorbells_state[GXP_NUM_DOORBELLS_PER_VD];
 	enum gxp_virtual_device_state state;
 	/*
 	 * Record the gxp->power_mgr->blk_switch_count when the vd was
@@ -72,9 +84,24 @@ struct gxp_virtual_device {
 	 */
 	int slice_index;
 	/*
-	 * The SG table that holds the firmware data region.
+	 * The SG table that holds the firmware RW data region.
 	 */
-	struct sg_table *fwdata_sgt;
+	struct sg_table *rwdata_sgt[GXP_NUM_CORES];
+	/*
+	 * The SG table that holds the regions specified in the image config's
+	 * non-secure IOMMU mappings.
+	 */
+	struct {
+		dma_addr_t daddr;
+		struct sg_table *sgt;
+	} ns_regions[GCIP_IMG_CFG_MAX_NS_IOMMU_MAPPINGS];
+	/* The firmware size specified in image config. */
+	u32 fw_ro_size;
+	/*
+	 * The config regions specified in image config.
+	 * core_cfg's size should be a multiple of GXP_NUM_CORES.
+	 */
+	struct gxp_mapped_resource core_cfg, vd_cfg, sys_cfg;
 	uint core_list;
 	/*
 	 * The ID of DSP client. -1 if it is not allocated.
@@ -106,13 +133,14 @@ struct gxp_virtual_device {
 	/* Whether it's the first time allocating a VMBox for this VD. */
 	bool first_open;
 	bool is_secure;
+	refcount_t refcount;
+	/* A constant ID assigned after VD is allocated. For debug only. */
+	int vdid;
+	struct gcip_image_config_parser cfg_parser;
+	/* The config version specified in firmware's image config. */
+	u32 config_version;
 };
 
-/*
- * TODO(b/193180931) cleanup the relationship between the internal GXP modules.
- * For example, whether or not gxp_vd owns the gxp_fw module, and if so, if
- * other modules are expected to access the gxp_fw directly or only via gxp_vd.
- */
 /*
  * Initializes the device management subsystem and allocates resources for it.
  * This is expected to be called once per driver lifecycle.
@@ -145,12 +173,15 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 					   u16 requested_cores);
 
 /**
- * gxp_vd_release() - Cleanup and free a struct gxp_virtual_device
+ * gxp_vd_release() - Cleanup a struct gxp_virtual_device
  * @vd: The virtual device to be released
  *
  * The caller must have locked gxp->vd_semaphore for writing.
  *
  * A virtual device must be stopped before it can be released.
+ *
+ * If @vd's reference count is 1 before this call, this function frees @vd.
+ * Otherwise @vd's state is set to GXP_VD_RELEASED.
  */
 void gxp_vd_release(struct gxp_virtual_device *vd);
 
@@ -189,13 +220,6 @@ void gxp_vd_stop(struct gxp_virtual_device *vd);
  * The caller must have locked gxp->vd_semaphore for reading.
  */
 int gxp_vd_virt_core_to_phys_core(struct gxp_virtual_device *vd, u16 virt_core);
-
-/*
- * Acquires the physical core IDs assigned to the virtual device.
- *
- * The caller must have locked gxp->vd_semaphore for reading.
- */
-uint gxp_vd_phys_core_list(struct gxp_virtual_device *vd);
 
 /**
  * gxp_vd_mapping_store() - Store a mapping in a virtual device's records
@@ -329,5 +353,44 @@ bool gxp_vd_has_and_use_credit(struct gxp_virtual_device *vd);
  * Releases the credit.
  */
 void gxp_vd_release_credit(struct gxp_virtual_device *vd);
+
+/* Increases reference count of @vd by one and returns @vd. */
+static inline struct gxp_virtual_device *
+gxp_vd_get(struct gxp_virtual_device *vd)
+{
+	WARN_ON_ONCE(!refcount_inc_not_zero(&vd->refcount));
+	return vd;
+}
+
+/*
+ * Decreases reference count of @vd by one.
+ *
+ * If @vd->refcount becomes 0, @vd will be freed.
+ */
+void gxp_vd_put(struct gxp_virtual_device *vd);
+
+/*
+ * Change the status of the vd of @client_id to GXP_VD_UNAVAILABLE.
+ * Internally, it will discard all pending/unconsumed user commands
+ * and call the `gxp_vd_block_unready` function.
+ *
+ * This function will be called when the `CLIENT_FATAL_ERROR_NOTIFY`
+ * RKCI has been sent from the firmware side.
+ *
+ * @gxp: The GXP device to obtain the handler for
+ * @client_id: client_id of the crashed vd.
+ * @core_list: A bitfield enumerating the physical cores on which
+ *             crash is reported from firmware.
+ */
+void gxp_vd_invalidate(struct gxp_dev *gxp, int client_id, uint core_list);
+
+/*
+ * An ID between 0~GXP_NUM_CORES-1 and is unique to each VD.
+ * Only used in direct mode.
+ */
+static inline uint gxp_vd_hw_slot_id(struct gxp_virtual_device *vd)
+{
+	return ffs(vd->core_list) - 1;
+}
 
 #endif /* __GXP_VD_H__ */

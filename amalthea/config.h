@@ -8,6 +8,8 @@
 #ifndef __AMALTHEA_CONFIG_H__
 #define __AMALTHEA_CONFIG_H__
 
+#include <linux/sizes.h>
+
 #define GXP_DRIVER_NAME "gxp_platform"
 #define DSP_FIRMWARE_DEFAULT_PREFIX "gxp_fw_core"
 
@@ -16,6 +18,13 @@
 #define GXP_NUM_CORES 4
 #define GXP_NUM_MAILBOXES GXP_NUM_CORES
 #define GXP_NUM_WAKEUP_DOORBELLS GXP_NUM_CORES
+
+/* The total size of the configuration region. */
+#define GXP_SHARED_BUFFER_SIZE SZ_256K
+/* Size of slice per VD. */
+#define GXP_SHARED_SLICE_SIZE 0x9000 /* 36K */
+/* At most GXP_NUM_CORES VDs can be supported on Amalthea. */
+#define GXP_NUM_SHARED_SLICES GXP_NUM_CORES
 
 #define GXP_USE_LEGACY_MAILBOX 1
 

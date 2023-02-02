@@ -932,4 +932,88 @@ struct gxp_mailbox_uci_response_ioctl {
 #define GXP_MAILBOX_UCI_RESPONSE                                               \
 	_IOR(GXP_IOCTL_BASE, 31, struct gxp_mailbox_uci_response_ioctl)
 
+/*
+ * struct gxp_create_sync_fence_data
+ * @seqno:		the seqno to initialize the fence with
+ * @timeline_name:	the name of the timeline the fence belongs to
+ * @fence:		returns the fd of the new sync_file with the new fence
+ *
+ * Timeline names can be up to 128 characters (including trailing NUL byte)
+ * for gxp debugfs and kernel debug logs.  These names are truncated to 32
+ * characters in the data returned by the standard SYNC_IOC_FILE_INFO
+ * ioctl.
+ */
+#define GXP_SYNC_TIMELINE_NAME_LEN 128
+struct gxp_create_sync_fence_data {
+	__u32 seqno;
+	char timeline_name[GXP_SYNC_TIMELINE_NAME_LEN];
+	__s32 fence;
+};
+
+/*
+ * Create a DMA sync fence, return the sync_file fd for the new fence.
+ *
+ * The client must have allocated a virtual device.
+ */
+#define GXP_CREATE_SYNC_FENCE                                                  \
+	_IOWR(GXP_IOCTL_BASE, 32, struct gxp_create_sync_fence_data)
+
+/*
+ * struct gxp_signal_sync_fence_data
+ * @fence:		fd of the sync_file for the fence
+ * @error:		error status errno value or zero for success
+ */
+struct gxp_signal_sync_fence_data {
+	__s32 fence;
+	__s32 error;
+};
+
+/*
+ * Signal a DMA sync fence with optional error status.
+ * Can pass a sync_file fd created by any driver.
+ * Signals the first DMA sync fence in the sync file.
+ */
+#define GXP_SIGNAL_SYNC_FENCE                                                  \
+	_IOW(GXP_IOCTL_BASE, 33, struct gxp_signal_sync_fence_data)
+
+/*
+ * struct gxp_sync_fence_status
+ * @fence:		fd of the sync_file for the fence
+ * @status:		returns:
+ *			   0 if active
+ *			   1 if signaled with no error
+ *			   negative errno value if signaled with error
+ */
+struct gxp_sync_fence_status {
+	__s32 fence;
+	__s32 status;
+};
+
+/*
+ * Retrieve DMA sync fence status.
+ * Can pass a sync_file fd created by any driver.
+ * Returns the status of the first DMA sync fence in the sync file.
+ */
+#define GXP_SYNC_FENCE_STATUS                                                  \
+	_IOWR(GXP_IOCTL_BASE, 34, struct gxp_sync_fence_status)
+
+/*
+ * struct gxp_register_invalidated_eventfd_ioctl
+ * @eventfd:            File-descriptor obtained via eventfd().
+ *                      Not used during the unregister step.
+ */
+struct gxp_register_invalidated_eventfd_ioctl {
+	__u32 eventfd;
+};
+
+/*
+ * Registers an eventfd which will be triggered when the device crashes and
+ * the virtual device of the client is invalidated.
+ */
+#define GXP_REGISTER_INVALIDATED_EVENTFD                                       \
+	_IOW(GXP_IOCTL_BASE, 35, struct gxp_register_invalidated_eventfd_ioctl)
+
+#define GXP_UNREGISTER_INVALIDATED_EVENTFD                                     \
+	_IOW(GXP_IOCTL_BASE, 36, struct gxp_register_invalidated_eventfd_ioctl)
+
 #endif /* __GXP_H__ */
