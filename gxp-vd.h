@@ -10,6 +10,7 @@
 
 #include <linux/iommu.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/refcount.h>
 #include <linux/rwsem.h>
@@ -39,6 +40,11 @@ struct mailbox_resp_queue {
 	spinlock_t lock;
 	/* Waitqueue to wait on if the queue is empty */
 	wait_queue_head_t waitq;
+	/*
+	 * If true, the user cannot send requests anymore.
+	 * This must be protected by @lock.
+	 */
+	bool wait_queue_closed;
 };
 
 enum gxp_virtual_device_state {
@@ -139,6 +145,10 @@ struct gxp_virtual_device {
 	struct gcip_image_config_parser cfg_parser;
 	/* The config version specified in firmware's image config. */
 	u32 config_version;
+	/* Protects @dma_fence_list. */
+	struct mutex fence_list_lock;
+	/* List of GXP DMA fences owned by this VD. */
+	struct list_head gxp_fence_list;
 };
 
 /*

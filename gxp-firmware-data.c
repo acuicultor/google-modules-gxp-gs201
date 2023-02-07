@@ -22,29 +22,29 @@
  * The minimum alignment order (power of 2) of allocations in the firmware data
  * region.
  */
-#define FW_DATA_STORAGE_ORDER		3
+#define FW_DATA_STORAGE_ORDER 3
 
 /* A byte pattern to pre-populate the FW region with */
-#define FW_DATA_DEBUG_PATTERN		0x66
+#define FW_DATA_DEBUG_PATTERN 0x66
 
 /* IDs for dedicated doorbells used by some system components */
 #define DOORBELL_ID_CORE_WAKEUP(__core__) (0 + __core__)
 
 /* IDs for dedicated sync barriers used by some system components */
-#define SYNC_BARRIER_ID_UART		1
+#define SYNC_BARRIER_ID_UART 1
 
 /* Default application parameters */
-#define DEFAULT_APP_ID			1
-#define DEFAULT_APP_USER_MEM_SIZE	(120 * 1024)
-#define DEFAULT_APP_USER_MEM_ALIGNMENT	8
-#define DEFAULT_APP_THREAD_COUNT	2
-#define DEFAULT_APP_TCM_PER_BANK	(100 * 1024)
-#define DEFAULT_APP_USER_DOORBELL_COUNT	2
-#define DEFAULT_APP_USER_BARRIER_COUNT	2
+#define DEFAULT_APP_ID 1
+#define DEFAULT_APP_USER_MEM_SIZE (120 * 1024)
+#define DEFAULT_APP_USER_MEM_ALIGNMENT 8
+#define DEFAULT_APP_THREAD_COUNT 2
+#define DEFAULT_APP_TCM_PER_BANK (100 * 1024)
+#define DEFAULT_APP_USER_DOORBELL_COUNT 2
+#define DEFAULT_APP_USER_BARRIER_COUNT 2
 
 /* Core-to-core mailbox communication constants */
-#define CORE_TO_CORE_MBX_CMD_COUNT	10
-#define CORE_TO_CORE_MBX_RSP_COUNT	10
+#define CORE_TO_CORE_MBX_CMD_COUNT 10
+#define CORE_TO_CORE_MBX_RSP_COUNT 10
 
 /* A block allocator managing and partitioning a memory region for device use */
 struct fw_memory_allocator {
@@ -595,25 +595,29 @@ static void set_system_cfg_region(struct gxp_dev *gxp, void *sys_cfg)
 	else
 		des_ro->debug_dump_dev_addr = 0;
 
-#define COPY_FIELDS                                                            \
+#define COPY_FIELDS(des, ro, rw)                                               \
 	do {                                                                   \
-		tel_ro->host_status = tel_des->host_status;                    \
-		tel_ro->buffer_addr = tel_des->buffer_addr;                    \
-		tel_ro->buffer_size = tel_des->buffer_size;                    \
-		tel_rw->device_status = tel_des->device_status;                \
-		tel_rw->data_available = tel_des->watermark_level;             \
+		ro->host_status = des->host_status;                            \
+		ro->buffer_addr = des->buffer_addr;                            \
+		ro->buffer_size = des->buffer_size;                            \
+		rw->device_status = des->device_status;                        \
+		rw->data_available = des->watermark_level;                     \
 	} while (0)
 	for (i = 0; i < GXP_NUM_CORES; i++) {
 		tel_ro = &des_ro->telemetry_desc.per_core_loggers[i];
 		tel_rw = &des_rw->telemetry_desc.per_core_loggers[i];
 		tel_des = &descriptor->per_core_loggers[i];
-		COPY_FIELDS;
+		COPY_FIELDS(tel_des, tel_ro, tel_rw);
 		tel_ro = &des_ro->telemetry_desc.per_core_tracers[i];
 		tel_rw = &des_rw->telemetry_desc.per_core_tracers[i];
 		tel_des = &descriptor->per_core_tracers[i];
-		COPY_FIELDS;
+		COPY_FIELDS(tel_des, tel_ro, tel_rw);
 	}
 #undef COPY_FIELDS
+
+	/* Update the global descriptors. */
+	gxp->data_mgr->sys_desc_ro = des_ro;
+	gxp->data_mgr->sys_desc_rw = des_rw;
 }
 
 static struct app_metadata *
@@ -632,7 +636,7 @@ _gxp_fw_data_create_app(struct gxp_dev *gxp, struct gxp_virtual_device *vd)
 	 * initialization of legacy mode, and have here copy the values to the
 	 * config region.
 	 */
-	if (vd->vdid == 0)
+	if (vd->vdid == 1)
 		set_system_cfg_region(gxp, vd->sys_cfg.vaddr);
 	app = kzalloc(sizeof(*app), GFP_KERNEL);
 	if (!app)
@@ -782,9 +786,9 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 		goto err;
 
 	/* Shared firmware data memory region */
-	mgr->allocator = mem_alloc_create(gxp, mgr->fw_data_virt,
-					  gxp->fwdatabuf.daddr,
-					  gxp->fwdatabuf.size);
+	mgr->allocator =
+		mem_alloc_create(gxp, mgr->fw_data_virt, gxp->fwdatabuf.daddr,
+				 gxp->fwdatabuf.size);
 	if (IS_ERR(mgr->allocator)) {
 		dev_err(gxp->dev,
 			"Failed to create the FW data memory allocator\n");
@@ -902,13 +906,14 @@ int gxp_fw_data_set_core_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
 		/* Validate that the provided IOVAs are addressable (i.e. 32-bit) */
 		for (core = 0; core < GXP_NUM_CORES; core++) {
 			if (buffers && buffers[core].dsp_addr > U32_MAX &&
-				buffers[core].size == per_buffer_size)
+			    buffers[core].size == per_buffer_size)
 				return -EINVAL;
 		}
 
 		for (core = 0; core < GXP_NUM_CORES; core++) {
 			core_descriptors[core].host_status = host_status;
-			core_descriptors[core].buffer_addr = (u32)buffers[core].dsp_addr;
+			core_descriptors[core].buffer_addr =
+				(u32)buffers[core].dsp_addr;
 			core_descriptors[core].buffer_size = per_buffer_size;
 		}
 	} else {
@@ -922,14 +927,12 @@ int gxp_fw_data_set_core_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
 	return 0;
 }
 
-u32 gxp_fw_data_get_core_telemetry_device_status(struct gxp_dev *gxp, uint core,
-						 u8 type)
+static u32
+gxp_fw_data_get_core_telemetry_device_status_legacy(struct gxp_dev *gxp,
+						    uint core, u8 type)
 {
 	struct gxp_core_telemetry_descriptor *descriptor =
 		gxp->data_mgr->core_telemetry_mem.host_addr;
-
-	if (core >= GXP_NUM_CORES)
-		return 0;
 
 	switch (type) {
 	case GXP_TELEMETRY_TYPE_LOGGING:
@@ -938,5 +941,38 @@ u32 gxp_fw_data_get_core_telemetry_device_status(struct gxp_dev *gxp, uint core,
 		return descriptor->per_core_tracers[core].device_status;
 	default:
 		return 0;
+	}
+}
+
+static u32 _gxp_fw_data_get_core_telemetry_device_status(struct gxp_dev *gxp,
+							 uint core, u8 type)
+{
+	struct gxp_system_descriptor_rw *des_rw = gxp->data_mgr->sys_desc_rw;
+
+	switch (type) {
+	case GXP_TELEMETRY_TYPE_LOGGING:
+		return des_rw->telemetry_desc.per_core_loggers[core]
+			.device_status;
+	case GXP_TELEMETRY_TYPE_TRACING:
+		return des_rw->telemetry_desc.per_core_tracers[core]
+			.device_status;
+	default:
+		return 0;
+	}
+}
+
+u32 gxp_fw_data_get_core_telemetry_device_status(struct gxp_dev *gxp, uint core,
+						 u8 type)
+{
+	if (core >= GXP_NUM_CORES)
+		return 0;
+
+	if (gxp->firmware_mgr->img_cfg.config_version >=
+	    FW_DATA_PROTOCOL_PER_VD_CONFIG) {
+		return _gxp_fw_data_get_core_telemetry_device_status(gxp, core,
+								     type);
+	} else {
+		return gxp_fw_data_get_core_telemetry_device_status_legacy(
+			gxp, core, type);
 	}
 }
