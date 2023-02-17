@@ -22,6 +22,7 @@
 #include "gxp-dma.h"
 #include "gxp-domain-pool.h"
 #include "gxp-doorbell.h"
+#include "gxp-eventfd.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-host-device-structs.h"
@@ -31,7 +32,6 @@
 #include "gxp-notification.h"
 #include "gxp-pm.h"
 #include "gxp-vd.h"
-#include "gxp-wakelock.h"
 
 static inline void hold_core_in_reset(struct gxp_dev *gxp, uint core)
 {
@@ -147,8 +147,8 @@ static int map_resource(struct gxp_virtual_device *vd,
 {
 	if (res->daddr == 0)
 		return 0;
-	return gxp_iommu_map(vd->gxp, vd->domain, res->daddr, res->paddr, res->size,
-			     IOMMU_READ | IOMMU_WRITE);
+	return gxp_iommu_map(vd->gxp, vd->domain, res->daddr, res->paddr,
+			     res->size, IOMMU_READ | IOMMU_WRITE);
 }
 
 /* Reverts map_resource. */
@@ -382,7 +382,8 @@ static int alloc_and_map_fw_image(struct gxp_dev *gxp,
 	/* Maps all FW regions together and no rwdata_sgt in this case. */
 	if (ro_size == gxp->fwbufs[0].size)
 		return gxp_iommu_map(gxp, gdomain, gxp->fwbufs[0].daddr,
-				     gxp->fwbufs[0].paddr, ro_size * GXP_NUM_CORES,
+				     gxp->fwbufs[0].paddr,
+				     ro_size * GXP_NUM_CORES,
 				     IOMMU_READ | IOMMU_WRITE);
 
 	dev_info(gxp->dev, "mapping firmware RO size %#zx", ro_size);
@@ -413,7 +414,8 @@ static int alloc_and_map_fw_image(struct gxp_dev *gxp,
 		if (ret) {
 			dev_err(gxp->dev, "map firmware RW for core %d failed",
 				i);
-			gxp_iommu_unmap(gxp, gdomain, gxp->fwbufs[i].daddr, ro_size);
+			gxp_iommu_unmap(gxp, gdomain, gxp->fwbufs[i].daddr,
+					ro_size);
 			goto err_unmap;
 		}
 	}
@@ -443,7 +445,8 @@ static void unmap_and_free_fw_image(struct gxp_dev *gxp,
 	int i;
 
 	if (ro_size == gxp->fwbufs[0].size) {
-		gxp_iommu_unmap(gxp, gdomain, gxp->fwbufs[0].daddr, ro_size * GXP_NUM_CORES);
+		gxp_iommu_unmap(gxp, gdomain, gxp->fwbufs[0].daddr,
+				ro_size * GXP_NUM_CORES);
 		return;
 	}
 
@@ -654,6 +657,24 @@ static void set_config_version(struct gxp_dev *gxp,
 		gxp->fwdatabuf.daddr = 0;
 }
 
+static void debug_dump_lock(struct gxp_dev *gxp, struct gxp_virtual_device *vd)
+{
+	if (!mutex_trylock(&vd->debug_dump_lock)) {
+		/*
+		 * Release @gxp->vd_semaphore to let other virtual devices proceed
+		 * their works and wait for the debug dump to finish.
+		 */
+		up_write(&gxp->vd_semaphore);
+		mutex_lock(&vd->debug_dump_lock);
+		down_write(&gxp->vd_semaphore);
+	}
+}
+
+static inline void debug_dump_unlock(struct gxp_virtual_device *vd)
+{
+	mutex_unlock(&vd->debug_dump_lock);
+}
+
 struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 					   u16 requested_cores)
 {
@@ -683,6 +704,7 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 	vd->vdid = atomic_inc_return(&gxp->next_vdid);
 	mutex_init(&vd->fence_list_lock);
 	INIT_LIST_HEAD(&vd->gxp_fence_list);
+	mutex_init(&vd->debug_dump_lock);
 
 	vd->domain = gxp_domain_pool_alloc(gxp->domain_pool);
 	if (!vd->domain) {
@@ -785,6 +807,7 @@ void gxp_vd_release(struct gxp_virtual_device *vd)
 	uint core_list = vd->core_list;
 
 	lockdep_assert_held_write(&gxp->vd_semaphore);
+	debug_dump_lock(gxp, vd);
 
 	if (vd->is_secure) {
 		mutex_lock(&gxp->secure_vd_lock);
@@ -819,30 +842,37 @@ void gxp_vd_release(struct gxp_virtual_device *vd)
 	if (vd->slice_index >= 0)
 		ida_free(&vd->gxp->shared_slice_idp, vd->slice_index);
 	gxp_domain_pool_free(vd->gxp->domain_pool, vd->domain);
+
+	if (vd->invalidate_eventfd)
+		gxp_eventfd_put(vd->invalidate_eventfd);
+	vd->invalidate_eventfd = NULL;
+
 	vd->state = GXP_VD_RELEASED;
+	debug_dump_unlock(vd);
 	gxp_vd_put(vd);
 }
 
 int gxp_vd_block_ready(struct gxp_virtual_device *vd)
 {
 	struct gxp_dev *gxp = vd->gxp;
+	enum gxp_virtual_device_state orig_state;
 	int ret;
 
 	lockdep_assert_held_write(&gxp->vd_semaphore);
 
-	if (vd->state == GXP_VD_SUSPENDED)
-		return 0;
-	if (vd->state != GXP_VD_OFF)
+	orig_state = vd->state;
+	if (orig_state != GXP_VD_OFF && orig_state != GXP_VD_SUSPENDED)
 		return -EINVAL;
 	ret = gxp_dma_domain_attach_device(gxp, vd->domain, vd->core_list);
 	if (ret)
 		return ret;
-	vd->state = GXP_VD_READY;
+	if (orig_state == GXP_VD_OFF)
+		vd->state = GXP_VD_READY;
 	if (gxp->after_vd_block_ready) {
 		ret = gxp->after_vd_block_ready(gxp, vd);
 		if (ret) {
 			gxp_dma_domain_detach_device(gxp, vd->domain);
-			vd->state = GXP_VD_OFF;
+			vd->state = orig_state;
 			return ret;
 		}
 	}
@@ -853,16 +883,19 @@ void gxp_vd_block_unready(struct gxp_virtual_device *vd)
 {
 	struct gxp_dev *gxp = vd->gxp;
 
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+
 	if (gxp->before_vd_block_unready)
 		gxp->before_vd_block_unready(gxp, vd);
+	gxp_dma_domain_detach_device(gxp, vd->domain);
 }
 
 int gxp_vd_run(struct gxp_virtual_device *vd)
 {
 	struct gxp_dev *gxp = vd->gxp;
-	int ret = 0;
+	int ret;
 
-	lockdep_assert_held(&gxp->vd_semaphore);
+	lockdep_assert_held_write(&gxp->vd_semaphore);
 	if (vd->state != GXP_VD_READY && vd->state != GXP_VD_OFF)
 		return -EINVAL;
 	if (vd->state == GXP_VD_OFF) {
@@ -886,15 +919,20 @@ int gxp_vd_run(struct gxp_virtual_device *vd)
 		if (ret)
 			goto err_vd_unavailable;
 	}
+
+	debug_dump_lock(gxp, vd);
 	/* Clear all doorbells */
 	vd_restore_doorbells(vd);
 	ret = gxp_firmware_run(gxp, vd, vd->core_list);
 	if (ret)
 		goto err_vd_block_unready;
 	vd->state = GXP_VD_RUNNING;
-	return ret;
+	debug_dump_unlock(vd);
+
+	return 0;
 
 err_vd_block_unready:
+	debug_dump_unlock(vd);
 	gxp_vd_block_unready(vd);
 err_vd_unavailable:
 	vd->state = GXP_VD_UNAVAILABLE;
@@ -927,7 +965,9 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 	uint core_list = vd->core_list;
 	uint lpm_state;
 
-	lockdep_assert_held(&gxp->vd_semaphore);
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+	debug_dump_lock(gxp, vd);
+
 	if (gxp_core_boot &&
 	    (vd->state == GXP_VD_OFF || vd->state == GXP_VD_READY ||
 	     vd->state == GXP_VD_RUNNING) &&
@@ -946,10 +986,10 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 	}
 
 	gxp_firmware_stop(gxp, vd, core_list);
-	if (vd->state == GXP_VD_READY || vd->state == GXP_VD_RUNNING ||
-	    vd->state == GXP_VD_UNAVAILABLE)
-		gxp_dma_domain_detach_device(gxp, vd->domain);
-	vd->state = GXP_VD_OFF;
+	if (vd->state != GXP_VD_UNAVAILABLE)
+		vd->state = GXP_VD_OFF;
+
+	debug_dump_unlock(vd);
 }
 
 static inline uint select_core(struct gxp_virtual_device *vd, uint virt_core,
@@ -1000,16 +1040,21 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 	u32 boot_state;
 	uint failed_cores = 0;
 
-#ifdef DISABLE_VD_SUSPEND_RESUME_SUPPORT
-	if (!gxp_is_direct_mode(gxp))
+	if (!gxp_is_direct_mode(gxp) && gxp_core_boot)
 		return gxp_vd_stop(vd);
-#endif
 	lockdep_assert_held_write(&gxp->vd_semaphore);
-	dev_info(gxp->dev, "Suspending VD ...\n");
+	debug_dump_lock(gxp, vd);
+
+	dev_info(gxp->dev, "Suspending VD vdid=%d client_id=%d...\n", vd->vdid,
+		 vd->client_id);
 	if (vd->state == GXP_VD_SUSPENDED) {
 		dev_err(gxp->dev,
 			"Attempt to suspend a virtual device twice\n");
-		return;
+		goto out;
+	}
+	if (!gxp_core_boot) {
+		vd->state = GXP_VD_SUSPENDED;
+		goto out;
 	}
 	gxp_pm_force_clkmux_normal(gxp);
 	/*
@@ -1076,7 +1121,6 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 					     LPM_CG_STATE);
 		}
 	}
-	gxp_dma_domain_detach_device(gxp, vd->domain);
 	if (vd->state == GXP_VD_UNAVAILABLE) {
 		/* shutdown all cores if virtual device is unavailable */
 		for (phys_core = 0; phys_core < GXP_NUM_CORES; phys_core++)
@@ -1090,6 +1134,8 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 		vd->state = GXP_VD_SUSPENDED;
 	}
 	gxp_pm_resume_clkmux(gxp);
+out:
+	debug_dump_unlock(vd);
 }
 
 /*
@@ -1107,11 +1153,18 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 	uint failed_cores = 0;
 
 	lockdep_assert_held_write(&gxp->vd_semaphore);
-	dev_info(gxp->dev, "Resuming VD ...\n");
+	debug_dump_lock(gxp, vd);
+	dev_info(gxp->dev, "Resuming VD vdid=%d client_id=%d...\n", vd->vdid,
+		 vd->client_id);
 	if (vd->state != GXP_VD_SUSPENDED) {
 		dev_err(gxp->dev,
 			"Attempt to resume a virtual device which was not suspended\n");
-		return -EBUSY;
+		ret = -EBUSY;
+		goto out;
+	}
+	if (!gxp_core_boot) {
+		vd->state = GXP_VD_RUNNING;
+		goto out;
 	}
 	gxp_pm_force_clkmux_normal(gxp);
 	curr_blk_switch_count = gxp_pm_get_blk_switch_count(gxp);
@@ -1119,7 +1172,6 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 	/* Restore the doorbells state for this VD. */
 	vd_restore_doorbells(vd);
 
-	gxp_dma_domain_attach_device(gxp, vd->domain, core_list);
 	/*
 	 * Start the resume process for all of this VD's cores without waiting
 	 * for completion.
@@ -1201,11 +1253,12 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 			if (core_list & BIT(phys_core))
 				gxp_pm_core_off(gxp, phys_core);
 		}
-		gxp_dma_domain_detach_device(gxp, vd->domain);
 	} else {
 		vd->state = GXP_VD_RUNNING;
 	}
 	gxp_pm_resume_clkmux(gxp);
+out:
+	debug_dump_unlock(vd);
 	return ret;
 }
 
@@ -1404,12 +1457,10 @@ void gxp_vd_put(struct gxp_virtual_device *vd)
 		kfree(vd);
 }
 
-void gxp_vd_invalidate(struct gxp_dev *gxp, int client_id, uint core_list)
+void gxp_vd_invalidate_with_client_id(struct gxp_dev *gxp, int client_id,
+				      uint core_list)
 {
 	struct gxp_client *client = NULL, *c;
-	release_unconsumed_async_resps_t release_unconsumed_async_resps =
-		gxp->mailbox_mgr->release_unconsumed_async_resps;
-	int ret;
 	uint core;
 
 	/*
@@ -1455,37 +1506,69 @@ void gxp_vd_invalidate(struct gxp_dev *gxp, int client_id, uint core_list)
 		return;
 	}
 
-	dev_err(gxp->dev, "Invalidate a VD, VDID=%d, client_id=%d",
-		client->vd->vdid, client_id);
+	gxp_vd_invalidate(gxp, client->vd);
+	gxp_vd_generate_debug_dump(gxp, client->vd, core_list);
 
-	if (client->vd->state != GXP_VD_UNAVAILABLE) {
-		if (client->has_block_wakelock) {
-			if (release_unconsumed_async_resps)
-				release_unconsumed_async_resps(client->vd);
-			gxp_vd_block_unready(client->vd);
-		}
+	up_write(&gxp->vd_semaphore);
+	up_write(&client->semaphore);
+}
 
-		client->vd->state = GXP_VD_UNAVAILABLE;
-		if (client->vd_invalid_eventfd)
-			gxp_eventfd_signal(client->vd_invalid_eventfd);
+void gxp_vd_invalidate(struct gxp_dev *gxp, struct gxp_virtual_device *vd)
+{
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+
+	dev_err(gxp->dev, "Invalidate a VD, VDID=%d, client_id=%d", vd->vdid,
+		vd->client_id);
+
+	if (vd->state != GXP_VD_UNAVAILABLE) {
+		if (gxp->mailbox_mgr->release_unconsumed_async_resps)
+			gxp->mailbox_mgr->release_unconsumed_async_resps(vd);
+
+		vd->state = GXP_VD_UNAVAILABLE;
+
+		if (vd->invalidate_eventfd)
+			gxp_eventfd_signal(vd->invalidate_eventfd);
 	} else {
 		dev_dbg(gxp->dev, "This VD is already invalidated");
 	}
+}
 
+void gxp_vd_generate_debug_dump(struct gxp_dev *gxp,
+				struct gxp_virtual_device *vd, uint core_list)
+{
+	int ret;
+
+	if (!gxp_debug_dump_is_enabled() || !core_list)
+		return;
+
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+
+	/*
+	 * We should increase the refcount of @vd because @gxp->vd_semaphore will be
+	 * released below and the client can release it asynchronously.
+	 */
+	vd = gxp_vd_get(vd);
+
+	/*
+	 * Release @gxp->vd_semaphore before generating a debug dump and hold it
+	 * again after completing debug dump to not block other virtual devices
+	 * proceeding their work.
+	 */
 	up_write(&gxp->vd_semaphore);
+	mutex_lock(&vd->debug_dump_lock);
+
 	/*
 	 * Process debug dump if its enabled and core_list is not empty.
 	 * Keep on hold the client lock while processing the dumps. vd
-	 * lock would be taken  and released inside the debug dump
+	 * lock would be taken and released inside the debug dump
 	 * implementation logic ahead.
 	 */
-	if (gxp_debug_dump_is_enabled() && core_list != 0) {
-		ret = gxp_debug_dump_process_dump_mcu_mode(gxp, core_list,
-							   client->vd);
-		if (ret)
-			dev_err(gxp->dev,
-				"debug dump processing failed (ret=%d).\n",
-				ret);
-	}
-	up_write(&client->semaphore);
+	ret = gxp_debug_dump_process_dump_mcu_mode(gxp, core_list, vd);
+	if (ret)
+		dev_err(gxp->dev, "debug dump processing failed (ret=%d).\n",
+			ret);
+
+	mutex_unlock(&vd->debug_dump_lock);
+	down_write(&gxp->vd_semaphore);
+	gxp_vd_put(vd);
 }
