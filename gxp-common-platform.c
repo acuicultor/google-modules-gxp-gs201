@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * GXP platform driver utilities.
  *
@@ -9,6 +9,7 @@
 #include <linux/platform_data/sscoredump.h>
 #endif
 
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/file.h>
@@ -36,6 +37,7 @@
 #include "gxp-domain-pool.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
+#include "gxp-firmware-loader.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
 #include "gxp-mailbox.h"
@@ -144,13 +146,10 @@ static int gxp_open(struct inode *inode, struct file *file)
 					   misc_dev);
 	int ret = 0;
 
-	/* If this is the first call to open(), request the firmware files */
-	ret = gxp_firmware_request_if_needed(gxp);
-	if (ret) {
-		dev_err(gxp->dev,
-			"Failed to request dsp firmware files (ret=%d)\n", ret);
+	/* If this is the first call to open(), load the firmware files */
+	ret = gxp_firmware_loader_load_if_needed(gxp);
+	if (ret)
 		return ret;
-	}
 
 	client = gxp_client_create(gxp);
 	if (IS_ERR(client))
@@ -893,8 +892,8 @@ static int map_tpu_mbx_queue(struct gxp_client *client,
 
 	down_read(&gxp->vd_semaphore);
 
-	core_count = client->vd->num_cores;
 	phys_core_list = client->vd->core_list;
+	core_count = hweight_long(phys_core_list);
 
 	mbx_info = kmalloc(
 		sizeof(struct edgetpu_ext_mailbox_info) +
@@ -977,8 +976,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	int ret = 0;
 
 	if (!gxp->tpu_dev.mbx_paddr) {
-		dev_err(gxp->dev, "%s: TPU is not available for interop\n",
-			__func__);
+		dev_err(gxp->dev, "TPU is not available for interop\n");
 		return -EINVAL;
 	}
 
@@ -1014,8 +1012,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 		goto out_unlock_client_semaphore;
 	}
 
-	/* TODO(b/237624453): remove '|| 1' once the MCU supports DSP->TPU interop */
-	if (gxp_is_direct_mode(gxp) || 1) {
+	if (gxp_is_direct_mode(gxp)) {
 		ret = map_tpu_mbx_queue(client, &ibuf);
 		if (ret)
 			goto err_fput_tpu_file;
@@ -1030,7 +1027,8 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	goto out_unlock_client_semaphore;
 
 err_unmap_tpu_mbx_queue:
-	unmap_tpu_mbx_queue(client, &ibuf);
+	if (gxp_is_direct_mode(gxp))
+		unmap_tpu_mbx_queue(client, &ibuf);
 err_fput_tpu_file:
 	fput(client->tpu_file);
 	client->tpu_file = NULL;
@@ -1068,8 +1066,7 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	if (gxp->before_unmap_tpu_mbx_queue)
 		gxp->before_unmap_tpu_mbx_queue(gxp, client);
 
-	/* TODO(b/237624453): remove '|| 1' once the MCU supports DSP->TPU interop */
-	if (gxp_is_direct_mode(gxp) || 1)
+	if (gxp_is_direct_mode(gxp))
 		unmap_tpu_mbx_queue(client, &ibuf);
 
 	fput(client->tpu_file);
@@ -1837,6 +1834,8 @@ static int gxp_set_reg_resources(struct platform_device *pdev, struct gxp_dev *g
 		gxp->cmu.paddr = r->start;
 		gxp->cmu.size = resource_size(r);
 		gxp->cmu.vaddr = devm_ioremap_resource(dev, r);
+		if (IS_ERR_OR_NULL(gxp->cmu.vaddr))
+			dev_warn(dev, "Failed to map CMU registers\n");
 	}
 	/*
 	 * TODO (b/224685748): Remove this block after CMU CSR is supported
@@ -2062,6 +2061,12 @@ static int gxp_common_platform_probe(struct platform_device *pdev, struct gxp_de
 		goto err_domain_pool_destroy;
 	}
 
+	ret = gxp_firmware_loader_init(gxp);
+	if (ret) {
+		dev_err(dev, "Failed to initialize firmware loader (ret=%d)\n",
+			ret);
+		goto err_fw_destroy;
+	}
 	gxp_dma_init_default_resources(gxp);
 	gxp_vd_init(gxp);
 
@@ -2085,11 +2090,10 @@ static int gxp_common_platform_probe(struct platform_device *pdev, struct gxp_de
 		dev_err(dev, "Failed to initialize core telemetry (ret=%d)", ret);
 		goto err_fw_data_destroy;
 	}
-	gxp->thermal_mgr = gxp_thermal_init(gxp);
-	if (IS_ERR(gxp->thermal_mgr)) {
-		ret = PTR_ERR(gxp->thermal_mgr);
+
+	ret = gxp_thermal_init(gxp);
+	if (ret)
 		dev_warn(dev, "Failed to init thermal driver: %d\n", ret);
-	}
 
 	gxp->gfence_mgr = gcip_dma_fence_manager_create(gxp->dev);
 	if (IS_ERR(gxp->gfence_mgr)) {
@@ -2105,6 +2109,11 @@ static int gxp_common_platform_probe(struct platform_device *pdev, struct gxp_de
 		if (ret)
 			goto err_dma_fence_destroy;
 	}
+	/*
+	 * We only know where the system config region is after after_probe is
+	 * done so this can't be called earlier.
+	 */
+	gxp_fw_data_populate_system_config(gxp);
 
 	gxp->misc_dev.minor = MISC_DYNAMIC_MINOR;
 	gxp->misc_dev.name = GXP_NAME;
@@ -2127,12 +2136,14 @@ err_before_remove:
 err_dma_fence_destroy:
 	/* DMA fence manager creation doesn't need revert */
 err_thermal_destroy:
-	/* thermal init doesn't need revert */
+	gxp_thermal_exit(gxp);
 	gxp_core_telemetry_exit(gxp);
 err_fw_data_destroy:
 	gxp_fw_data_destroy(gxp);
 err_vd_destroy:
 	gxp_vd_destroy(gxp);
+	gxp_firmware_loader_destroy(gxp);
+err_fw_destroy:
 	gxp_fw_destroy(gxp);
 err_domain_pool_destroy:
 	gxp_domain_pool_destroy(gxp->domain_pool);
@@ -2156,6 +2167,11 @@ static int gxp_common_platform_remove(struct platform_device *pdev)
 {
 	struct gxp_dev *gxp = platform_get_drvdata(pdev);
 
+	/*
+	 * Call gxp_thermal_exit before gxp_remove_debugdir since it will
+	 * remove its own debugfs.
+	 */
+	gxp_thermal_exit(gxp);
 	gxp_remove_debugdir(gxp);
 	misc_deregister(&gxp->misc_dev);
 	if (gxp->before_remove)
@@ -2163,6 +2179,7 @@ static int gxp_common_platform_remove(struct platform_device *pdev)
 	gxp_core_telemetry_exit(gxp);
 	gxp_fw_data_destroy(gxp);
 	gxp_vd_destroy(gxp);
+	gxp_firmware_loader_destroy(gxp);
 	gxp_fw_destroy(gxp);
 	gxp_domain_pool_destroy(gxp->domain_pool);
 	kfree(gxp->domain_pool);

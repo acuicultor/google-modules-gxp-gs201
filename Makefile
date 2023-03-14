@@ -22,6 +22,7 @@ gxp-objs += \
 		gxp-doorbell.o \
 		gxp-eventfd.o \
 		gxp-firmware-data.o \
+		gxp-firmware-loader.o \
 		gxp-firmware.o \
 		gxp-lpm.o \
 		gxp-mailbox-manager.o \
@@ -29,7 +30,6 @@ gxp-objs += \
 		gxp-mapping.o \
 		gxp-mb-notification.o \
 		gxp-pm.o \
-		gxp-range-alloc.o \
 		gxp-ssmt.o \
 		gxp-thermal.o \
 		gxp-vd.o

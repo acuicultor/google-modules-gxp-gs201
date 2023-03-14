@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Legacy implementation of the GXP mailbox interface.
  * This file must be used only when the kernel driver has to compile the implementation of the

@@ -81,7 +81,7 @@ static int gxp_dma_ssmt_program(struct gxp_dev *gxp,
 	uint core;
 
 	/* Program VID only when cores are managed by us. */
-	if (gxp_is_direct_mode(gxp) || gxp_core_boot) {
+	if (gxp_is_direct_mode(gxp) || gxp_core_boot(gxp)) {
 		pasid = iommu_aux_get_pasid(domain, gxp->dev);
 		for (core = 0; core < GXP_NUM_CORES; core++)
 			if (BIT(core) & core_list) {
@@ -90,8 +90,7 @@ static int gxp_dma_ssmt_program(struct gxp_dev *gxp,
 				gxp_ssmt_set_core_vid(&mgr->ssmt, core, pasid);
 			}
 	} else {
-		for (core = 0; core < GXP_NUM_CORES; core++)
-			gxp_ssmt_set_core_bypass(&mgr->ssmt, core);
+		gxp_ssmt_set_bypass(&mgr->ssmt);
 	}
 	return 0;
 }
@@ -323,6 +322,9 @@ int gxp_dma_map_core_resources(struct gxp_dev *gxp,
 	uint i;
 	struct iommu_domain *domain = gdomain->domain;
 
+	if (!gxp_is_direct_mode(gxp))
+		return 0;
+
 	ret = gxp_map_csrs(gxp, domain, &gxp->regs);
 	if (ret)
 		goto err;
@@ -376,6 +378,9 @@ void gxp_dma_unmap_core_resources(struct gxp_dev *gxp,
 {
 	uint i;
 	struct iommu_domain *domain = gdomain->domain;
+
+	if (!gxp_is_direct_mode(gxp))
+		return;
 
 	/* Only unmap the TPU mailboxes if they were found on probe */
 	if (gxp->tpu_dev.mbx_paddr) {
